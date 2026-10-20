@@ -1,0 +1,24 @@
+{
+  "name": "pcl3",
+  "productName": "PCL3",
+  "version": "0.1.0",
+  "description": "A Minecraft launcher rewrite: direct Mojang metadata, mirror-aware downloads, Microsoft OAuth.",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import ./test/ts-resolve.mjs --test \"test/**/*.test.ts\"",
+    "test:watch": "node --import ./test/ts-resolve.mjs --test --watch \"test/**/*.test.ts\"",
+    "check:encoding": "node scripts/check-encoding.mjs",
+    "verify": "npm run typecheck && npm run check:encoding && npm test"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  }
+}

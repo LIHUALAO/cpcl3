@@ -32,7 +32,7 @@
 
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 
 import type { Account, VersionManifest, VersionSummary } from '../core/types.js';
 import { VanillaInstaller, type DetailInstallPlan } from '../core/install/index.js';
@@ -1514,6 +1514,22 @@ function isEntryPoint(): boolean {
 }
 
 if (isEntryPoint()) {
+  // Windows 控制台默认代码页是 GBK（936），而 Node 的 stdout 永远输出 UTF-8。
+  // 不切代码页的话所有中文都是「宸插惎鍔」这种乱码。
+  //
+  // 为什么在 Node 里切而不是在 .bat 里切：bat 里执行 `chcp 65001` 会让 bat
+  // **自身**的 GBK 中文字符串先被读坏（cmd 逐行读脚本，切码影响后续行）。
+  // 在 Node 进程里切只影响这个控制台会话，不会破坏 bat 已读入的内容。
+  //
+  // 输出被重定向到文件时没有控制台，失败也无所谓，吞掉即可。
+  if (process.platform === 'win32' && process.stdout.isTTY === true) {
+    try {
+      spawnSync('chcp', ['65001'], { stdio: 'ignore', windowsHide: true, shell: true });
+    } catch {
+      /* 没有控制台就跳过 */
+    }
+  }
+
   runCli(process.argv.slice(2))
     .then((code) => {
       process.exitCode = code;

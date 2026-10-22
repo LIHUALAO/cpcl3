@@ -14,6 +14,9 @@
  *     切换镜像时把该 URL 的 host 换成镜像 host（path/search 保留）。
  */
 
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+
 import type { DownloadArtifact, VersionJson, VersionManifest, VersionSummary } from '../types.js';
 import { getDataRoot as defaultGetDataRoot } from './dataRoot.js';
 import { MetaCache, type CacheEntry } from './cache.js';
@@ -116,6 +119,8 @@ export class VersionRepository {
   private readonly timeoutMs: number;
   private readonly retries: number;
   private readonly fetchJsonImpl: FetchJsonFn;
+  /** 数据根（不含结尾分隔符）；用于定位 `<dataRoot>/versions/<id>/<id>.json` */
+  private readonly dataRootDir: string;
 
   /** 同一进程内的 manifest 并发去重 */
   private manifestInflight: Promise<VersionManifest> | undefined;
@@ -130,7 +135,8 @@ export class VersionRepository {
     this.fetchJsonImpl = opts.fetchImpl ?? fetchJson;
 
     const dataRoot = opts.dataRoot ?? (opts.getDataRoot ?? defaultGetDataRoot)();
-    this.cache = new MetaCache(`${dataRoot.replace(/[\\/]+$/, '')}/meta`);
+    this.dataRootDir = dataRoot.replace(/[\\/]+$/, '');
+    this.cache = new MetaCache(`${this.dataRootDir}/meta`);
   }
 
   /** 当前生效的镜像根（undefined 表示走官方） */
@@ -219,8 +225,13 @@ export class VersionRepository {
 
   /**
    * 拉取单个版本 JSON。
-   * 优先用磁盘缓存（有缓存且未过期则不触网）；缓存缺失或过期时从 manifest 里找到 `url` 再拉取。
-   * 是否走镜像由构造函数决定。
+   *
+   * 解析顺序（本地优先，已装版本不依赖网络）：
+   *   1. 内存/磁盘 meta 缓存且新鲜 → 直接返回（不触网）
+   *   2. **本地已安装版本** `<dataRoot>/versions/<id>/<id>.json` → 返回并回填缓存
+   *      （Fabric / Quilt / Forge 这类加载器版本根本不在 Mojang manifest 里，
+   *      只走 manifest 会抛「not found」，全靠过期缓存兜底是错误路径）
+   *   3. manifest → 官方/镜像 URL 拉取
    */
   async fetchVersion(id: string): Promise<VersionJson> {
     assertSafeVersionId(id);
@@ -241,6 +252,26 @@ export class VersionRepository {
     return task;
   }
 
+  /**
+   * 读本地已安装的版本 JSON（`<dataRoot>/versions/<id>/<id>.json`）。
+   *
+   * 这是「装过的版本」的真源：install / loader 都把 JSON 落在版本目录，
+   * 而这批 id 通常不在 Mojang manifest 里（加载器、自定义版本）。
+   * 读不到返回 undefined，绝不抛错。
+   */
+  readInstalledVersion(id: string): VersionJson | undefined {
+    assertSafeVersionId(id);
+    const file = path.join(this.dataRootDir, 'versions', id, `${id}.json`);
+    try {
+      const text = fs.readFileSync(file, 'utf8');
+      const data = JSON.parse(text) as VersionJson;
+      if (!data || typeof data !== 'object' || typeof data.id !== 'string') return undefined;
+      return data;
+    } catch {
+      return undefined;
+    }
+  }
+
   private async loadVersion(id: string, cached: CacheEntry<VersionJson>): Promise<VersionJson> {
     const fileName = `${id}.json`;
     let url = '';
@@ -248,6 +279,24 @@ export class VersionRepository {
       const manifest = await this.fetchManifest();
       const summary = manifest.versions.find((v) => v.id === id);
       if (!summary) {
+        // ── 关键分支：不在 manifest 里 → 先看本地已安装的版本 ──
+        // 加载器版本（fabric-loader-x-y）永远不在 manifest 里，它只存在于
+        // <dataRoot>/versions/<id>/<id>.json。之前这里直接 throw，全靠
+        // 「过期缓存兜底」侥幸拿到数据，缓存缺失时就会崩。
+        const installed = this.readInstalledVersion(id);
+        if (installed) {
+          this.logger.debug?.(`[version] version "${id}" not in manifest, using installed copy from disk`);
+          try {
+            this.cache.write<VersionJson>(fileName, installed, {
+              fetchedAt: Date.now(),
+              url: 'local-installed',
+              mirror: this.mirrorRoot !== undefined,
+            });
+          } catch (err) {
+            this.logger.warn(`[version] failed to persist ${id} cache: ${(err as Error).message}`);
+          }
+          return installed;
+        }
         throw new Error(`version "${id}" not found in manifest`);
       }
       // 版本 JSON 的真实 URL 来自 manifest 的 url 字段；切镜像时把 host 换成镜像 host

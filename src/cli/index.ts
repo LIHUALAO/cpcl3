@@ -4,10 +4,21 @@
  *   pcl3 versions [--limit N] [--all] [--type release|snapshot|all] [--json]
  *   pcl3 install <versionId> [--dry-run] [--json]
  *   pcl3 launch <versionId> [--username NAME] [--memory MB] [--java PATH] [--instance DIR] [--dry-run]
+ *   pcl3 settings show <versionId> [--json]
+ *   pcl3 settings set <versionId> [--memory MB] [--min-memory MB] [--jvm-arg ARG]...
+ *                                  [--game-arg ARG]... [--java PATH] [--width N] [--height N] [--fullscreen]
+ *   pcl3 settings reset <versionId>
  *   pcl3 account login [--no-open] [--json]
  *   pcl3 account offline <name> [--json]
  *   pcl3 account list [--json]
  *   pcl3 doctor [--json] [--timeout SEC] [--no-network]
+ *   pcl3 loader list <kind> <gameVersion> [--limit N] [--json]
+ *   pcl3 loader install <kind> <gameVersion> [loaderVersion] [--json]
+ *
+ * 全局配置（infra 追加）：
+ *   pcl3 config [--json]                       查看当前全局配置（含配置文件路径）
+ *   pcl3 config set-dir <dir>                  修改数据目录（校验 + 提示迁移，不自动搬数据）
+ *   pcl3 config set-mirror <id|auto>           固定下载源 / 恢复自动测速
  *
  * 结构：
  *   - `COMMANDS` 是路由表（命令路径 → 定义），纯数据，便于测试。
@@ -29,6 +40,13 @@ import { resolveDeps, type ResolvedDeps } from '../core/install/deps.js';
 import { GameLauncher } from '../core/launch/index.js';
 import { MicrosoftAuth, loadAccounts, offlineAccount, saveAccounts } from '../core/auth/index.js';
 import {
+  LoaderInstaller,
+  LoaderPreconditionError,
+  LOADER_LABEL,
+  type LoaderKind,
+  type LoaderVersion,
+} from '../core/loader/index.js';
+import {
   ASSET_PROBE_HASH,
   BMCLAPI_ASSET_PREFIX,
   BMCLAPI_ROOT,
@@ -42,6 +60,19 @@ import {
   PISTON_MANIFEST_URL,
 } from '../core/install/endpoints.js';
 import { UsageError, parseArgs, type FlagsSpec, type ParsedArgs } from './args.js';
+// ── 基础设施（infra-dev 追加）：源测速 / 全局配置 ─────────────────────────
+import { GlobalConfigStore, defaultConfigPath, installConfigHook } from '../core/config/index.js';
+import { MIRROR_DEFINITIONS, MirrorSelector, type MirrorProbe } from '../core/net/index.js';
+import {
+  DEFAULT_MEMORY_MB,
+  MEMORY_MAX_MB,
+  MEMORY_MIN_MB,
+  SettingsStore,
+  SettingsValidationError,
+  defaultSettings,
+  toLaunchOptionFields,
+  type InstanceSettings,
+} from '../core/settings/index.js';
 import {
   ProgressBar,
   bold,
@@ -75,6 +106,22 @@ export interface CliContext {
   env: NodeJS.ProcessEnv;
   openBrowser: (url: string) => Promise<boolean>;
   probe: (url: string, timeoutMs: number) => Promise<ProbeResult>;
+  /**
+   * 加载器安装器工厂（测试可注入 fake，不联网）。
+   * 不传时 loader 命令现场用真实 `LoaderInstaller` + deps 里的仓库/下载器装配。
+   */
+  loaderFactory?: (deps: ResolvedDeps) => LoaderInstaller;
+  /**
+   * 【infra 追加】源测速器（测试注入 fake，避免真实联网）。
+   * 不传时 doctor 现场按全局配置装配真实 `MirrorSelector`。
+   */
+  mirrorSelector?: MirrorSelectorLike;
+}
+
+/** 源测速器的最小结构约束（doctor 只用这两个方法） */
+export interface MirrorSelectorLike {
+  probeAll(opts?: { timeoutMs?: number }): Promise<MirrorProbe[]>;
+  best(opts?: { timeoutMs?: number }): Promise<MirrorProbe>;
 }
 
 const defaultIO: CliIO = {
@@ -83,13 +130,15 @@ const defaultIO: CliIO = {
 };
 
 export async function createContext(overrides: Partial<CliContext> = {}): Promise<CliContext> {
-  return {
+  const base: CliContext = {
     io: overrides.io ?? defaultIO,
     deps: overrides.deps ?? (await resolveDeps()),
     env: overrides.env ?? process.env,
     openBrowser: overrides.openBrowser ?? openBrowserDefault,
     probe: overrides.probe ?? probeUrl,
   };
+  if (overrides.loaderFactory !== undefined) base.loaderFactory = overrides.loaderFactory;
+  return base;
 }
 
 // ───────────────────────────── 路由表 ─────────────────────────────
@@ -241,7 +290,7 @@ const launchCommand: CommandDefinition = {
   flags: {
     values: {
       username: { type: 'string', default: 'Steve' },
-      memory: { type: 'number', default: 2048 },
+      memory: { type: 'number' },
       java: { type: 'string' },
       instance: { type: 'string' },
     },
@@ -258,11 +307,17 @@ const launchCommand: CommandDefinition = {
       versionId,
       instanceDir: String(args.values['instance'] ?? path.join(dataRoot, 'instances', versionId)),
       account,
-      memoryMB: num(args.values['memory'], 2048),
     };
+
+    // 内存 / JVM 参数 / Java 路径：默认取实例设置（没存过就是 2048）。
+    // `--memory`、`--java` 显式给了就压过存储值 —— 临时试一次不必改设置文件。
+    const store = new SettingsStore({ dataRoot });
+    Object.assign(options, toLaunchOptionFields(store.resolve(versionId)));
+
+    if (args.values['memory'] !== undefined) options['memoryMB'] = num(args.values['memory'], DEFAULT_MEMORY_MB);
     if (args.values['java'] !== undefined) options['javaPath'] = String(args.values['java']);
 
-    const launcher = new GameLauncher({ versionRepo: new ctx.deps.VersionRepository() });
+    const launcher = new GameLauncher({ versionRepo: new ctx.deps.VersionRepository(), dataRoot });
     const command = await launcher.buildCommand(options as never);
 
     if (bool(args.booleans['dry-run'])) {
@@ -274,6 +329,203 @@ const launchCommand: CommandDefinition = {
     return 0;
   },
 };
+
+// ───────────────────────────── settings ─────────────────────────────
+
+/** 一次 `--jvm-arg` / `--game-arg` 的累积器（args.ts 的 values 只留最后一个，重复项得自己扫） */
+export function collectRepeated(argv: readonly string[], names: readonly string[]): Record<string, string[]> {
+  const wanted = new Set(names);
+  const out: Record<string, string[]> = {};
+  for (let i = 0; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token === undefined || !token.startsWith('--')) continue;
+    const eq = token.indexOf('=');
+    const rawName = eq >= 0 ? token.slice(2, eq) : token.slice(2);
+    if (!wanted.has(rawName)) continue;
+    const value = eq >= 0 ? token.slice(eq + 1) : argv[i + 1];
+    if (value === undefined) continue;
+    if (eq < 0) i += 1;
+    const bucket = out[rawName] ?? [];
+    bucket.push(value);
+    out[rawName] = bucket;
+  }
+  return out;
+}
+
+const settingsShowCommand: CommandDefinition = {
+  path: ['settings', 'show'],
+  summary: '查看某个版本/实例的内存与 JVM 设置（没设过就显示默认值）',
+  usage: 'pcl3 settings show <versionId> [--json]',
+  flags: { booleans: { json: { default: false } } },
+  async run(args, ctx) {
+    const versionId = args.positional[0];
+    if (!versionId) throw new UsageError('缺少版本号，例如：pcl3 settings show 1.21', settingsShowCommand.usage);
+
+    const store = new SettingsStore({ dataRoot: ctx.deps.getDataRoot() });
+    const settings = store.resolve(versionId);
+    const stored = store.load(versionId) !== undefined;
+
+    if (bool(args.booleans['json'])) {
+      ctx.io.out(`${JSON.stringify({ ...settings, source: stored ? 'stored' : 'default' }, null, 2)}\n`);
+      return 0;
+    }
+
+    const rows: [string, string][] = [
+      ['版本', settings.versionId],
+      ['最大内存', `${String(settings.memoryMB ?? DEFAULT_MEMORY_MB)} MB`],
+      [
+        '最小内存',
+        settings.minMemoryMB === undefined
+          ? `${dim('自动（Xmx 的 1/4）')}`
+          : `${String(settings.minMemoryMB)} MB`,
+      ],
+      ['JVM 参数', renderArgs(settings.extraJvmArgs)],
+      ['游戏参数', renderArgs(settings.extraGameArgs)],
+      ['Java 路径', settings.javaPath ?? `${dim('自动查找 / 下载')}`],
+      [
+        '窗口',
+        settings.windowWidth !== undefined && settings.windowHeight !== undefined
+          ? `${String(settings.windowWidth)} × ${String(settings.windowHeight)}`
+          : `${dim('跟随游戏默认')}`,
+      ],
+      ['全屏', settings.fullscreen === true ? '是' : '否'],
+    ];
+    ctx.io.out(`${bold('实例设置')} ${cyan(versionId)}\n`);
+    for (const [key, value] of rows) ctx.io.out(`  ${dim(key.padEnd(10))} ${value}\n`);
+    ctx.io.out(
+      `\n${stored ? dim(`来源：${store.settingsPath(versionId)}`) : dim(`还没保存过，以上是默认值；保存：pcl3 settings set ${versionId} --memory 4096`)}\n`,
+    );
+    return 0;
+  },
+};
+
+const settingsSetCommand: CommandDefinition = {
+  path: ['settings', 'set'],
+  summary: '保存某个版本/实例的内存与 JVM 设置',
+  usage:
+    'pcl3 settings set <versionId> [--memory MB] [--min-memory MB] '
+    + '[--jvm-arg ARG]... [--game-arg ARG]... [--java PATH] [--width N] [--height N] [--fullscreen] [--reset]',
+  flags: {
+    values: {
+      memory: { type: 'number' },
+      'min-memory': { type: 'number' },
+      java: { type: 'string' },
+      width: { type: 'number' },
+      height: { type: 'number' },
+      'jvm-arg': { type: 'string' },
+      'game-arg': { type: 'string' },
+    },
+    booleans: { fullscreen: { default: false }, reset: { default: false }, json: { default: false } },
+  },
+  async run(args, ctx) {
+    const versionId = args.positional[0];
+    if (!versionId) throw new UsageError('缺少版本号，例如：pcl3 settings set 1.21 --memory 4096', settingsSetCommand.usage);
+
+    const store = new SettingsStore({ dataRoot: ctx.deps.getDataRoot() });
+
+    if (bool(args.booleans['reset'])) {
+      store.remove(versionId);
+      const back = store.resolve(versionId);
+      if (bool(args.booleans['json'])) ctx.io.out(`${JSON.stringify({ ...back, source: 'default' }, null, 2)}\n`);
+      else ctx.io.out(`${green('✔')} 已重置 ${bold(versionId)} 的设置（内存回到默认 ${String(DEFAULT_MEMORY_MB)} MB）\n`);
+      return 0;
+    }
+
+    const repeated = collectRepeated(args.raw, ['jvm-arg', 'game-arg']);
+    const jvmFlags = repeated['jvm-arg'] ?? [];
+    const gameFlags = repeated['game-arg'] ?? [];
+
+    const patch: InstanceSettings = { id: versionId, versionId };
+
+    const memory = optionalNumber(args.values['memory']);
+    if (memory !== undefined) patch.memoryMB = memory;
+    const minMemory = optionalNumber(args.values['min-memory']);
+    if (minMemory !== undefined) patch.minMemoryMB = minMemory;
+    if (jvmFlags.length > 0) patch.extraJvmArgs = jvmFlags;
+    if (gameFlags.length > 0) patch.extraGameArgs = gameFlags;
+    const javaArg = args.values['java'];
+    if (typeof javaArg === 'string' && javaArg.trim().length > 0) patch.javaPath = javaArg.trim();
+    const width = optionalNumber(args.values['width']);
+    if (width !== undefined) patch.windowWidth = width;
+    const height = optionalNumber(args.values['height']);
+    if (height !== undefined) patch.windowHeight = height;
+    if (bool(args.booleans['fullscreen'])) patch.fullscreen = true;
+
+    // 一个字都没给就别假装保存了什么：沿用已有设置（没有就是默认值），并明确告知
+    const touched = Object.keys(patch).filter((k) => k !== 'id' && k !== 'versionId');
+    const base = touched.length === 0 ? store.resolve(versionId) : patch;
+    const merged: InstanceSettings = { ...base, id: versionId, versionId };
+
+    try {
+      store.save(merged);
+    } catch (error) {
+      if (error instanceof SettingsValidationError) {
+        throw new UsageError(error.problems.join('\n'), settingsSetCommand.usage);
+      }
+      throw error;
+    }
+
+    const saved = store.resolve(versionId);
+    if (bool(args.booleans['json'])) {
+      ctx.io.out(`${JSON.stringify(saved, null, 2)}\n`);
+      return 0;
+    }
+    if (touched.length === 0) {
+      ctx.io.out(`${yellow('!')} 没有给出任何要修改的项，沿用当前设置。\n`);
+      ctx.io.out(`${dim('例子：')} pcl3 settings set ${versionId} --memory 4096 --jvm-arg "-XX:+UseG1GC"\n`);
+      return 0;
+    }
+    ctx.io.out(`${green('✔')} 已保存 ${bold(versionId)} 的设置\n`);
+    ctx.io.out(`  ${dim('最大内存')} ${String(saved.memoryMB ?? DEFAULT_MEMORY_MB)} MB\n`);
+    if (saved.minMemoryMB !== undefined) ctx.io.out(`  ${dim('最小内存')} ${String(saved.minMemoryMB)} MB\n`);
+    if (saved.extraJvmArgs !== undefined) ctx.io.out(`  ${dim('JVM 参数')} ${renderArgs(saved.extraJvmArgs)}\n`);
+    if (saved.javaPath !== undefined) ctx.io.out(`  ${dim('Java 路径')} ${saved.javaPath}\n`);
+    ctx.io.out(`  ${dim('文件')} ${store.settingsPath(versionId)}\n`);
+    return 0;
+  },
+};
+
+const settingsResetCommand: CommandDefinition = {
+  path: ['settings', 'reset'],
+  summary: '删除某个版本/实例的设置文件（内存回到默认值）',
+  usage: 'pcl3 settings reset <versionId> [--json]',
+  flags: { booleans: { json: { default: false } } },
+  async run(args, ctx) {
+    const versionId = args.positional[0];
+    if (!versionId) throw new UsageError('缺少版本号，例如：pcl3 settings reset 1.21', settingsResetCommand.usage);
+
+    const store = new SettingsStore({ dataRoot: ctx.deps.getDataRoot() });
+    const existed = store.load(versionId) !== undefined;
+    store.remove(versionId);
+    const back = store.resolve(versionId);
+
+    if (bool(args.booleans['json'])) {
+      ctx.io.out(`${JSON.stringify({ ...back, source: 'default', removed: existed }, null, 2)}\n`);
+      return 0;
+    }
+    ctx.io.out(
+      existed
+        ? `${green('✔')} 已删除 ${bold(versionId)} 的设置，内存回到默认 ${String(DEFAULT_MEMORY_MB)} MB\n`
+        : `${dim(`${versionId} 本来就没有保存过设置，内存就是默认 ${String(DEFAULT_MEMORY_MB)} MB`)}\n`,
+    );
+    return 0;
+  },
+};
+
+function renderArgs(list: readonly string[] | undefined): string {
+  if (list === undefined || list.length === 0) return dim('（无）');
+  return list.join(' ');
+}
+
+function optionalNumber(value: string | number | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim().length > 0) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
+}
 
 // ───────────────────────────── account ─────────────────────────────
 
@@ -384,6 +636,8 @@ export interface DoctorReport {
   modules: ResolvedDeps['real'];
   java: JavaInfo;
   checks: DoctorRow[];
+  /** 【infra 追加】各下载源实测延迟（`--no-network` 时为空数组） */
+  mirrors: MirrorProbe[];
 }
 
 const doctorCommand: CommandDefinition = {
@@ -415,6 +669,27 @@ const doctorCommand: CommandDefinition = {
 
     ctx.io.out(`${bold('PCL3 环境自检')}\n\n`);
     ctx.io.out(`${renderTable(['检查项', '状态', '详情', '耗时', '目标'], table)}\n\n`);
+
+    // 【infra 追加】源测速表：各源延迟 + 最终选谁
+    if (report.mirrors.length > 0) {
+      const mirrorRows = report.mirrors.map((m, i) => [
+        `${i === 0 && m.ok ? '★ ' : '  '}${m.id}`,
+        m.ok ? green('✔ 可用') : red('✘ 不可用'),
+        m.ok ? `${String(Math.round(m.latencyMs))} ms` : '超时 / 失败',
+        shorten(m.base, 42),
+        i === 0 && m.ok ? '← 当前选用' : '',
+      ]);
+      ctx.io.out(`${bold('下载源测速')} ${dim('（同一文件，每个源测 2 次取最小值，超时 5 秒）')}\n\n`);
+      ctx.io.out(`${renderTable(['源', '状态', '延迟', '地址', ''], mirrorRows)}\n\n`);
+      const best = report.mirrors[0];
+      if (best !== undefined && best.ok) {
+        ctx.io.out(`${dim('自动换源会选：')} ${cyan(best.id)}${dim(`（${String(Math.round(best.latencyMs))} ms）`)}\n\n`);
+      } else {
+        ctx.io.out(`${red('✘')} 所有下载源都测不通。安装/更新会失败，先检查网络与代理。\n\n`);
+      }
+    } else {
+      ctx.io.out(`${dim('（--no-network：跳过源测速）')}\n\n`);
+    }
 
     const failed = report.checks.filter((r) => !r.ok);
     if (failed.length === 0) {
@@ -496,6 +771,26 @@ export async function buildDoctorReport(
     }
   }
 
+  // 【infra 追加】源测速：与上面的「端点可达」是两件事 ——
+  // 上面回答「这个 URL 通不通」，这里回答「哪个源最快、该不该换源」。
+  // --no-network 时整段跳过（不发任何请求，也不读缓存里的旧结果冒充新数据）。
+  let mirrors: MirrorProbe[] = [];
+  if (!opts.skipNetwork) {
+    mirrors = await probeMirrors(ctx, opts.timeoutMs);
+    const best = mirrors.find((m) => m.ok);
+    checks.push({
+      name: '源测速',
+      target: best?.base ?? '（无可用源）',
+      ok: best !== undefined,
+      detail:
+        best === undefined
+          ? '所有下载源都不可用'
+          : `最快 ${best.id} ${String(Math.round(best.latencyMs))} ms`
+            + `（共 ${String(mirrors.filter((m) => m.ok).length)}/${String(mirrors.length)} 个可用）`,
+      ms: best?.ok === true ? Math.round(best.latencyMs) : 0,
+    });
+  }
+
   return {
     dataRoot,
     node: process.versions['node'] ?? '?',
@@ -503,19 +798,446 @@ export async function buildDoctorReport(
     modules: ctx.deps.real,
     java,
     checks,
+    mirrors,
   };
 }
+
+/**
+ * 【infra 追加】跑一次源测速。
+ *
+ * 失败语义：测速器本身抛错（配置坏、构造失败）时**不让 doctor 崩**——
+ * 返回空数组，由调用方显示「跳过」。真实 `MirrorSelector` 自己就把网络失败
+ * 折算成 `ok:false` 的结果，不会抛。
+ */
+export async function probeMirrors(ctx: CliContext, timeoutMs: number): Promise<MirrorProbe[]> {
+  // 超时沿用 doctor 的 --timeout（默认 8 秒），但单源上限就是 5 秒，取小值
+  const perSourceTimeout = Math.max(500, Math.min(5_000, timeoutMs));
+  try {
+    const selector = ctx.mirrorSelector ?? buildMirrorSelector(ctx);
+    return await selector.probeAll({ timeoutMs: perSourceTimeout });
+  } catch {
+    return [];
+  }
+}
+
+/** 现场装配真实测速器：按全局配置决定固定源 / 自动测速 */
+function buildMirrorSelector(ctx: CliContext): MirrorSelectorLike {
+  const store = new GlobalConfigStore();
+  installConfigHook(store);
+  const cfg = store.load();
+  const fixed = cfg.autoProbeMirror === false && typeof cfg.preferredMirror === 'string'
+    && cfg.preferredMirror.trim() !== '';
+  return new MirrorSelector({
+    dataRoot: ctx.deps.getDataRoot(),
+    ...(fixed ? { preferredId: cfg.preferredMirror?.trim() } : {}),
+    // 所有已知源都参与测速（即使设置了固定源，doctor 也要把真实情况摆出来）
+    mirrors: MIRROR_DEFINITIONS,
+  });
+}
+
+// ───────────────────────────── loader ─────────────────────────────
+
+/** 只接受 fabric / quilt；其余给 UsageError（退出码 2），错误信息里列清可用值 */
+export function parseLoaderKindArg(raw: string | undefined): LoaderKind {
+  const text = (raw ?? '').trim().toLowerCase();
+  if (text === 'fabric' || text === 'quilt') return text;
+  throw new UsageError(
+    `加载器类型只能是 fabric 或 quilt，收到「${raw ?? ''}」。`,
+    'pcl3 loader <list|install> <fabric|quilt> <gameVersion> [loaderVersion]',
+  );
+}
+
+/**
+ * 装配加载器安装器。
+ *
+ * 直接用 deps 里的 VersionRepository / Downloader —— 它们已经在 `resolveDeps()`
+ * 收敛过，测试注入 fake 时这里天然就是 fake，不会偷偷联网。
+ */
+function makeLoaderInstaller(ctx: CliContext): LoaderInstaller {
+  if (ctx.loaderFactory !== undefined) return ctx.loaderFactory(ctx.deps);
+  const dataRoot = ctx.deps.getDataRoot();
+  return new LoaderInstaller({
+    versionRepo: new ctx.deps.VersionRepository(),
+    downloader: new ctx.deps.Downloader({ concurrency: 8, retries: 3 }),
+    dataRoot,
+  });
+}
+
+const loaderListCommand: CommandDefinition = {
+  path: ['loader', 'list'],
+  summary: '列出某个游戏版本可用的加载器版本（fabric / quilt）',
+  usage: 'pcl3 loader list <fabric|quilt> <gameVersion> [--limit N] [--json]',
+  flags: {
+    values: { limit: { type: 'number', default: 20 } },
+    booleans: { json: { default: false } },
+  },
+  async run(args, ctx) {
+    const kind = parseLoaderKindArg(args.positional[0]);
+    const gameVersion = (args.positional[1] ?? '').trim();
+    if (gameVersion === '') {
+      throw new UsageError(
+        '缺少游戏版本，例如：pcl3 loader list fabric 1.21',
+        loaderListCommand.usage,
+      );
+    }
+    const limit = Math.max(1, Math.floor(num(args.values['limit'], 20)));
+
+    const installer = makeLoaderInstaller(ctx);
+    let all: LoaderVersion[];
+    try {
+      all = await installer.listVersions(kind, gameVersion);
+    } catch (error) {
+      return reportLoaderError(ctx, error);
+    }
+    const shown = all.slice(0, limit);
+    const label = LOADER_LABEL[kind];
+
+    if (bool(args.booleans['json'])) {
+      ctx.io.out(`${JSON.stringify({ kind, gameVersion, total: all.length, versions: shown }, null, 2)}\n`);
+      return 0;
+    }
+
+    if (all.length === 0) {
+      ctx.io.out(`${yellow('!')} ${label} 没有返回任何版本，稍后重试。\n`);
+      return 0;
+    }
+
+    const rows = shown.map((v) => [
+      v.version,
+      v.stable ? green('stable') : yellow('非稳定'),
+      v.version === firstStable(all) ? '← 默认安装这条' : '',
+    ]);
+    ctx.io.out(`${bold(`${label} 可用版本`)} ${dim(`（游戏 ${gameVersion}）`)}\n\n`);
+    ctx.io.out(`${renderTable(['版本', '稳定性', ''], rows)}\n\n`);
+    ctx.io.out(
+      `${dim(
+        `共 ${String(all.length)} 个版本，显示 ${String(shown.length)} 个。` +
+          `${kind === 'quilt' ? '（Quilt 的 stable 是按版本号推断的，官方 meta 没有这个字段）' : ''}`,
+      )}\n`,
+    );
+    ctx.io.out(`${dim('安装：')} pcl3 loader install ${kind} ${gameVersion} <版本>\n`);
+    return 0;
+  },
+};
+
+/** 第一条 stable（没有就第一条），供列表高亮与 install 默认值共用 */
+function firstStable(list: LoaderVersion[]): string | undefined {
+  return (list.find((v) => v.stable) ?? list[0])?.version;
+}
+
+const loaderInstallCommand: CommandDefinition = {
+  path: ['loader', 'install'],
+  summary: '安装 Fabric / Quilt 加载器（不给版本则用最新稳定版）',
+  usage: 'pcl3 loader install <fabric|quilt> <gameVersion> [loaderVersion] [--json]',
+  flags: { booleans: { json: { default: false } } },
+  async run(args, ctx) {
+    const kind = parseLoaderKindArg(args.positional[0]);
+    const gameVersion = (args.positional[1] ?? '').trim();
+    if (gameVersion === '') {
+      throw new UsageError(
+        '缺少游戏版本，例如：pcl3 loader install fabric 1.21',
+        loaderInstallCommand.usage,
+      );
+    }
+
+    const label = LOADER_LABEL[kind];
+    const installer = makeLoaderInstaller(ctx);
+
+    let loaderVersion = (args.positional[2] ?? '').trim();
+    if (loaderVersion === '') {
+      // 不给版本 → 用最新稳定版；列表是 meta 顺序（新 → 旧）
+      let list: LoaderVersion[];
+      try {
+        list = await installer.listVersions(kind, gameVersion);
+      } catch (error) {
+        return reportLoaderError(ctx, error);
+      }
+      const picked = firstStable(list);
+      if (picked === undefined) {
+        ctx.io.err(`${red('✘')} ${label} meta 没有返回任何版本，无法确定默认版本。\n`);
+        return 1;
+      }
+      loaderVersion = picked;
+      ctx.io.out(`${dim(`未指定版本，使用最新稳定版 ${picked}`)}\n`);
+    }
+
+    const json = bool(args.booleans['json']);
+    if (!json) {
+      ctx.io.out(`${bold(`安装 ${label}`)} ${cyan(loaderVersion)} ${dim(`→ 原版 ${gameVersion}`)}\n`);
+    }
+
+    // 每个 phase 一条独立进度条（与 install 命令同一套范式）
+    let bar: ProgressBar | undefined;
+    let currentPhase = '';
+    let result: { versionId: string };
+    try {
+      result = await installer.install(kind, gameVersion, loaderVersion, (p) => {
+        if (json) return;
+        if (p.phase === 'done') {
+          bar?.finish();
+          bar = undefined;
+          return;
+        }
+        if (p.phase !== currentPhase) {
+          bar?.finish();
+          currentPhase = p.phase;
+          bar = new ProgressBar({
+            total: p.total,
+            label: p.phase === 'libraries' ? '依赖库' : p.phase,
+          });
+        }
+        (bar as ProgressBar).update(p.done);
+      });
+    } catch (error) {
+      bar?.finish();
+      return reportLoaderError(ctx, error);
+    } finally {
+      bar?.finish();
+    }
+
+    const dataRoot = ctx.deps.getDataRoot();
+    if (json) {
+      ctx.io.out(
+        `${JSON.stringify(
+          {
+            kind,
+            gameVersion,
+            loaderVersion,
+            versionId: result.versionId,
+            versionDir: path.join(dataRoot, 'versions', result.versionId),
+          },
+          null,
+          2,
+        )}\n`,
+      );
+      return 0;
+    }
+
+    ctx.io.out(`${green('✔')} ${label} 安装完成: ${bold(result.versionId)}\n`);
+    ctx.io.out(`${dim('版本目录:')} ${path.join(dataRoot, 'versions', result.versionId)}\n`);
+    ctx.io.out(`\n${dim('直接启动：')} ${cyan(`pcl3 launch ${result.versionId}`)}\n`);
+    return 0;
+  },
+};
+
+/** 把加载器相关异常翻成人话（前置条件错误要带 hint） */
+function reportLoaderError(ctx: CliContext, error: unknown): number {
+  if (error instanceof LoaderPreconditionError) {
+    ctx.io.err(`${red('✘')} ${error.message}\n`);
+    ctx.io.err(`${dim(error.hint)}\n`);
+    return 1;
+  }
+  return reportError(ctx, error);
+}
+
+// ───────────────────────────── config（infra 追加） ─────────────────────────────
+
+/**
+ * `pcl3 config` —— 查看 / 修改全局配置。
+ *
+ * 为什么要一个 CLI 入口：数据目录落在哪决定了「我的游戏装在哪」，
+ * 这是排障时第一个要确认的东西。GUI 之外留一条命令行路径，
+ * 用户可以把输出直接贴给别人（或者脚本里读 --json）。
+ */
+const configCommand: CommandDefinition = {
+  path: ['config'],
+  summary: '查看全局配置（数据目录 / 默认下载源）',
+  usage: 'pcl3 config [--json]',
+  flags: { booleans: { json: { default: false } } },
+  async run(args, ctx) {
+    const store = new GlobalConfigStore();
+    installConfigHook(store);
+    const cfg = store.load();
+    const dataRoot = ctx.deps.getDataRoot();
+
+    if (bool(args.booleans['json'])) {
+      ctx.io.out(
+        `${JSON.stringify(
+          {
+            config: cfg,
+            configPath: store.configPath,
+            dataRoot,
+            dataRootSource: dataRootSourceOf(cfg),
+            ...(store.loadProblem === undefined ? {} : { warning: store.loadProblem }),
+          },
+          null,
+          2,
+        )}\n`,
+      );
+      return 0;
+    }
+
+    const source = dataRootSourceOf(cfg);
+    ctx.io.out(`${bold('全局配置')}\n`);
+    ctx.io.out(`  ${dim('配置文件')}   ${store.configPath}\n`);
+    ctx.io.out(`  ${dim('数据目录')}   ${dataRoot} ${dim(`（来源：${source}）`)}\n`);
+    if (source === 'env') {
+      ctx.io.out(`  ${yellow('!')} 环境变量 PCL3_DATA_ROOT 覆盖了配置，改配置文件不会生效。\n`);
+    }
+    ctx.io.out(
+      `  ${dim('下载源')}     ${
+        cfg.autoProbeMirror === false && cfg.preferredMirror !== undefined
+          ? `${cfg.preferredMirror}${dim('（固定，不测速）')}`
+          : `${dim('自动测速')}${cfg.preferredMirror === undefined ? '' : dim(`（偏好 ${cfg.preferredMirror}）`)}`
+      }\n`,
+    );
+    if (store.loadProblem !== undefined) ctx.io.err(`${yellow('!')} ${store.loadProblem}\n`);
+    ctx.io.out(`\n${dim('改数据目录：')} pcl3 config set-dir D:\\PCL3\n`);
+    return 0;
+  },
+};
+
+/** 数据目录来源（与 download/paths.ts 的解析顺序一一对应） */
+export function dataRootSourceOf(cfg: { dataRoot?: string }): 'env' | 'config' | 'default' {
+  const fromEnv = process.env['PCL3_DATA_ROOT'];
+  if (typeof fromEnv === 'string' && fromEnv.trim() !== '') return 'env';
+  if (typeof cfg.dataRoot === 'string' && cfg.dataRoot.trim() !== '') return 'config';
+  return 'default';
+}
+
+const configSetDirCommand: CommandDefinition = {
+  path: ['config', 'set-dir'],
+  summary: '修改数据目录（校验可写；不自动迁移旧数据）',
+  usage: 'pcl3 config set-dir <目录> [--json]',
+  flags: { booleans: { json: { default: false } } },
+  async run(args, ctx) {
+    const dir = args.positional[0];
+    if (!dir) throw new UsageError('缺少目录，例如：pcl3 config set-dir D:\\PCL3', configSetDirCommand.usage);
+
+    const store = new GlobalConfigStore();
+    installConfigHook(store);
+    const result = await store.setDataRoot(dir);
+
+    if (bool(args.booleans['json'])) {
+      ctx.io.out(`${JSON.stringify(result, null, 2)}\n`);
+      return result.ok ? 0 : 1;
+    }
+
+    if (!result.ok) {
+      ctx.io.err(`${red('✘')} ${result.reason ?? '这个目录不能用作数据目录。'}\n`);
+      for (const warning of result.warnings) ctx.io.err(`  ${dim(warning)}\n`);
+      return 1;
+    }
+
+    for (const warning of result.warnings) ctx.io.out(`${yellow('!')} ${warning}\n`);
+    ctx.io.out(`${green('✔')} 数据目录已改为 ${bold(result.dataRoot ?? dir)}\n`);
+    if (result.notice !== undefined) ctx.io.out(`${result.notice}\n`);
+    if (result.notice === undefined) ctx.io.out(`${dim('（与当前目录相同，没有变化。）')}\n`);
+    return 0;
+  },
+};
+
+const configSetMirrorCommand: CommandDefinition = {
+  path: ['config', 'set-mirror'],
+  summary: '固定下载源，或 auto 恢复自动测速',
+  usage: `pcl3 config set-mirror <${MIRROR_DEFINITIONS.map((m) => m.id).join('|')}|auto> [--json]`,
+  flags: { booleans: { json: { default: false } } },
+  async run(args, ctx) {
+    const raw = (args.positional[0] ?? '').trim().toLowerCase();
+    if (raw === '') {
+      throw new UsageError(
+        `缺少源 id。可选：${MIRROR_DEFINITIONS.map((m) => m.id).join(' / ')} / auto`,
+        configSetMirrorCommand.usage,
+      );
+    }
+
+    const store = new GlobalConfigStore();
+    installConfigHook(store);
+
+    let saved;
+    try {
+      saved =
+        raw === 'auto'
+          ? store.update({ preferredMirror: null, autoProbeMirror: true })
+          : store.update({ preferredMirror: raw, autoProbeMirror: false });
+    } catch (error) {
+      throw new UsageError(error instanceof Error ? error.message : String(error), configSetMirrorCommand.usage);
+    }
+
+    if (bool(args.booleans['json'])) {
+      ctx.io.out(`${JSON.stringify(saved.config, null, 2)}\n`);
+      return 0;
+    }
+    ctx.io.out(
+      raw === 'auto'
+        ? `${green('✔')} 已恢复自动测速（每次按实测延迟选源）\n`
+        : `${green('✔')} 已固定使用 ${bold(raw)}，不再自动测速。恢复：pcl3 config set-mirror auto\n`,
+    );
+    return 0;
+  },
+};
+
+// ───────────────────────────── web ─────────────────────────────
+
+const webCommand: CommandDefinition = {
+  path: ['web'],
+  summary: '启动本地 Web UI（只监听 127.0.0.1）',
+  usage: 'pcl3 web [--port N] [--no-open]',
+  flags: {
+    values: { port: { type: 'number', default: 37421 } },
+    booleans: { 'no-open': { default: false } },
+  },
+  async run(args, ctx) {
+    // 动态 import：不启动 Web UI 时不必加载整套 HTTP 层
+    const { startWebServer } = await import('../web/server.js');
+    const port = num(args.values['port'], 37421);
+
+    let handle;
+    try {
+      handle = await startWebServer({ port, dataRoot: ctx.deps.getDataRoot() });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      ctx.io.err(`${red('启动失败')}：${msg}\n`);
+      if (msg.includes('EADDRINUSE')) {
+        ctx.io.err(`${dim(`端口 ${port} 已被占用，换个端口：pcl3 web --port ${port + 1}`)}\n`);
+      }
+      return 1;
+    }
+
+    ctx.io.out(`${bold('PCL3 Web UI')} 已启动\n`);
+    ctx.io.out(`  ${handle.url}\n`);
+    ctx.io.out(`  ${dim('只监听 127.0.0.1，数据不出本机。按 Ctrl+C 退出。')}\n`);
+
+    if (!bool(args.booleans['no-open'])) {
+      const opened = await ctx.openBrowser(handle.url);
+      if (!opened) {
+        ctx.io.out(`  ${dim('（没能自动打开浏览器，请手动访问上面的地址）')}\n`);
+      }
+    }
+
+    // 阻塞到 Ctrl+C，保证进程不退出、端口一直可用
+    await new Promise<void>((resolve) => {
+      const stop = (): void => {
+        ctx.io.out(`\n${dim('正在关闭…')}\n`);
+        void handle.close().then(resolve, resolve);
+      };
+      process.once('SIGINT', stop);
+      process.once('SIGTERM', stop);
+    });
+    return 0;
+  },
+};
 
 // ───────────────────────────── 路由 ─────────────────────────────
 
 export const COMMANDS: CommandDefinition[] = [
+  webCommand,
   versionsCommand,
   installCommand,
   launchCommand,
+  settingsShowCommand,
+  settingsSetCommand,
+  settingsResetCommand,
   accountLoginCommand,
   accountOfflineCommand,
   accountListCommand,
+  loaderListCommand,
+  loaderInstallCommand,
   doctorCommand,
+  // infra 追加：全局配置（数据目录 / 下载源）
+  configCommand,
+  configSetDirCommand,
+  configSetMirrorCommand,
 ];
 
 export function commandTokens(): string[][] {
@@ -552,7 +1274,11 @@ export async function runCli(argv: string[], ctx?: CliContext): Promise<number> 
 
   const def = findCommand(parsed.command);
   if (!def) {
-    if (parsed.command.length === 1 && parsed.command[0] === 'account') {
+    // 只给了命令组名（account / loader / settings）→ 打印帮助，不当成错误
+    if (
+      parsed.command.length === 1 &&
+      (parsed.command[0] === 'account' || parsed.command[0] === 'loader' || parsed.command[0] === 'settings')
+    ) {
       printHelp(context);
       return 0;
     }

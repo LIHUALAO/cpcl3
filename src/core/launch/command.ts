@@ -194,6 +194,43 @@ export function nativeRelativePath(lib: Library, classifier: string): string | n
   return null;
 }
 
+// ───────────────────────────── locale（首次启动中文，双保险） ─────────────────────────────
+
+/** 默认 JVM locale（与 options.txt 的 lang:zh_cn 配合，双保险） */
+export const DEFAULT_JVM_LOCALE: readonly string[] = Object.freeze(['-Duser.language=zh', '-Duser.country=CN']);
+
+/** 判断一组 args 里是否已声明某个 -D 键（容忍 `-Dk=v` / `-Dk v` 两种写法） */
+export function hasSystemProperty(args: readonly string[], key: string): boolean {
+  const flag = `-D${key}`;
+  for (let i = 0; i < args.length; i++) {
+    const t = args[i] as string;
+    // `-Dkey=value`（最常见）
+    if (t.startsWith(`${flag}=`)) return true;
+    // `-Dkey value`（分离写法）：后面必须跟一个非选项值，否则视为「空声明」
+    if (t === flag) {
+      const next = args[i + 1];
+      if (next !== undefined && !next.startsWith('-')) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * 补默认 locale 参数。
+ *
+ * 规则：
+ *   - 只补**缺失的那个键**：用户传了 `-Duser.language=ja` 就只补 `-Duser.country=CN`，不重复添 zh
+ *   - 两个键都在 → 原样返回
+ *
+ * 返回值是新数组，不修改入参。
+ */
+export function withDefaultLocale(args: readonly string[]): string[] {
+  const out = [...args];
+  if (!hasSystemProperty(out, 'user.language')) out.push('-Duser.language=zh');
+  if (!hasSystemProperty(out, 'user.country')) out.push('-Duser.country=CN');
+  return out;
+}
+
 export interface ClasspathInput {
   entries: readonly Library[];
   librariesRoot: string;

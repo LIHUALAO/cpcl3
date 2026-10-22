@@ -91,3 +91,46 @@ export function buildCandidates(
 
   return out;
 }
+
+/** 单次失败（供 `fallbackMirrorFromUrl` 用）：只描述「哪个失败、为什么」 */
+export interface CandidateFailure {
+  /** 失败时实际尝试的候选 URL（可能是镜像地址，也可能是原始地址） */
+  url: string;
+  /** 上一次尝试遇到的错误（缺省表示"试过了但没拿到错误对象"） */
+  error?: Error;
+}
+
+/**
+ * 从「失败的候选 URL」反推「该换哪个源」—— 只读辅助函数，不改动任何既有行为。
+ *
+ * 存在的理由：Downloader 想把「连续 N 次失败」上报给选源器（net 模块的
+ * `MirrorSelector.reportFailure`），但它手里只有候选 URL，不知道那串 URL 对应
+ * 哪一个镜像前缀。这里把反推逻辑放在 mirror.ts（镜像语义的唯一归属地），
+ * Downloader 只负责计数与回调，两边都不必知道对方的内部结构。
+ *
+ * 判定顺序：
+ *   1. 与原始 URL 完全一致 → `null`：失败来自**官方源本身**，不是镜像的问题，
+ *      不该拿它去降级任何镜像。
+ *   2. 命中某个镜像前缀 → 返回那个镜像的 base。
+ *   3. 都不匹配 → `null`（例如 policy='always' 套的自建镜像、或 URL 已变形）。
+ *
+ * 注意：这里比较的是「字符串前缀」，与 `buildCandidates` 的拼接方式完全对称
+ * （`base + subPath + pathname + search`），所以不会出现误判。
+ */
+export function fallbackMirrorFromUrl(
+  failure: CandidateFailure,
+  rawUrl: string,
+  mirrors: readonly string[],
+): string | null {
+  const failed = typeof failure.url === 'string' ? failure.url.trim() : '';
+  if (failed === '' || failed === rawUrl) return null;
+
+  let best: string | null = null;
+  for (const mirror of mirrors) {
+    if (typeof mirror !== 'string' || mirror.trim() === '') continue;
+    const base = mirror.trim().replace(/\/+$/, '');
+    // 取最长匹配：万一以后有 mirrors 里一个是另一个的前缀，也不会认错源
+    if (failed.startsWith(base) && (best === null || base.length > best.length)) best = base;
+  }
+  return best;
+}

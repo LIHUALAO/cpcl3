@@ -1,17 +1,24 @@
 /**
- * JVM 选择与进程内运行类。
+ * 启动期 Java 解析：**只查找，不下载**。
  *
- * 选择顺序：
- *   1. opts.javaPath（显式指定）—— 存在即用，不做版本校验
- *   2. `<dataRoot>/java/` 下与 `javaVersion.majorVersion` 匹配的 JRE
- *   3. 全部失败 → 抛错，绝不退回 PATH 里随便一个 java
+ * 自动下载的触发点在 `launcher.ts`（`buildCommand` 里 `pickJava` 之后），不放这里。
+ * 理由是 downloads = 网络 IO = 异步，而本模块的 `pickJava` 是同步的；把异步塞进同步函数
+ * 只会逼调用方改签名。因此职责切成两块：
  *
- * 注意：本机 Node 不在 PATH，因此不使用 `spawnSync('where', ...)` 之类的命令探测，
- * 一律直接读文件系统。
+ *   java.ts（本文件）   纯同步：显式 javaPath → 数据目录里按 majorVersion 匹配 → 明确报错
+ *   launcher.ts         拿到「没有可用 Java」这个信号后，调 JavaRuntimeInstaller 下载 → 再查一遍
+ *
+ * 这是对原有实现的最小扩展：新增一个 `pickJavaOrNull`（找不到返回 null 而不是抛错），
+ * 原 `pickJava` 的行为与错误文案保持逐字不变（launch 模块既有测试直接断言那段文案）。
+ *
+ * `JavaRequirement` 已抽到 `java-types.ts`（避免 java.ts ↔ java-provision.ts 循环 import），
+ * 这里原样再导出，`launch/index.ts` 与既有 import 路径都不用改。
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
+
+import type { JavaRequirement } from './java-types.js';
 
 const JAVA_BIN = process.platform === 'win32' ? 'javaw.exe' : 'java';
 
@@ -64,12 +71,7 @@ export function parseMajorVersion(text: string): number | null {
   return first;
 }
 
-export interface JavaRequirement {
-  /** 版本 JSON 里的 javaVersion.majorVersion；缺省按 8 */
-  majorVersion: number;
-  /** 版本 JSON 里的 javaVersion.component，如 jre-legacy / java-runtime-gamma */
-  component?: string;
-}
+export type { JavaRequirement };
 
 export interface JavaLookup {
   javaHome: string;
@@ -89,6 +91,30 @@ export interface JavaLookup {
  * `<home>/java-runtime-gamma/jdk-17/bin/java` 这种嵌套结构，深度限制 4 层。
  */
 export function findJavaInDataRoot(dataRoot: string, required: JavaRequirement): JavaLookup[] {
+  return scanJavaHomes(dataRoot, required)
+    .filter((f) => f.accepted)
+    .map((f) => f.lookup);
+}
+
+/**
+ * 单个 java home 的扫描结果。
+ *
+ * `accepted` 对应原来那套严格规则的判定；被拒的条目**故意保留**下来，
+ * 因为自动下载产出的布局是 `<dataRoot>/java/<component>/bin/java.exe`，
+ * 组件名（`java-runtime-delta`）里没有数字，靠路径猜不出大版本会被拒。
+ * 调用方可以拿 `javaHome` 再用权威来源（版本 JSON 的 majorVersion）复核。
+ */
+export interface ScannedJavaHome {
+  lookup: JavaLookup;
+  /** 原规则是否采纳 */
+  accepted: boolean;
+  /** 被拒原因；accepted 时为 undefined */
+  rejectedReason?: 'unparsable-major' | 'too-low';
+  score: number;
+}
+
+/** 扫描 `<dataRoot>/java` 下所有像 java home 的目录（不按版本过滤）。内部/高级 API。 */
+export function scanJavaHomes(dataRoot: string, required: JavaRequirement): ScannedJavaHome[] {
   const javaRoot = path.join(dataRoot, 'java');
   if (!isDirectory(javaRoot)) return [];
 
@@ -112,27 +138,34 @@ export function findJavaInDataRoot(dataRoot: string, required: JavaRequirement):
   };
   walk(javaRoot, 0);
 
-  const found: { lookup: JavaLookup; score: number }[] = [];
+  void javaRoot;
+
+  const out: ScannedJavaHome[] = [];
   for (const { home } of homes) {
     const rel = path.relative(javaRoot, home);
     const majorVersion = parseMajorVersion(rel);
-    // 读不出主版本号 → 无法保证兼容，不采用（由调用方报错要求用户指定）
-    if (majorVersion === null) continue;
-    // 低于要求的版本一律不用
-    if (majorVersion < required.majorVersion) continue;
-
     const component = rel.split(/[/\\]/)[0] ?? '';
+    const lookup: JavaLookup = { javaHome: home, majorVersion };
+    if (component !== '') lookup.component = component;
+
+    if (majorVersion === null) {
+      // 读不出主版本号 → 原规则不采用
+      out.push({ lookup, accepted: false, rejectedReason: 'unparsable-major', score: 0 });
+      continue;
+    }
+    if (majorVersion < required.majorVersion) {
+      out.push({ lookup, accepted: false, rejectedReason: 'too-low', score: 0 });
+      continue;
+    }
     let score = 0;
     if (required.component && component === required.component) score += 1000;
     // 版本号：越接近要求越好（major 相同最优）
     score += 500 - Math.min(499, (majorVersion - required.majorVersion) * 10);
-    const lookup: JavaLookup = { javaHome: home, majorVersion };
-    if (required.component) lookup.component = component;
-    found.push({ lookup, score });
+    out.push({ lookup, accepted: true, score });
   }
 
-  found.sort((a, b) => b.score - a.score || a.lookup.javaHome.localeCompare(b.lookup.javaHome));
-  return found.map((f) => f.lookup);
+  out.sort((a, b) => b.score - a.score || a.lookup.javaHome.localeCompare(b.lookup.javaHome));
+  return out;
 }
 
 /** 给用户看的明确错误信息 */
@@ -148,6 +181,47 @@ export function noJavaMessage(required: JavaRequirement, dataRoot: string, searc
   lines.push(`处理办法：1) 在启动选项里手动指定 javaPath（指向 java home 或其 bin/java 可执行文件）；`
     + `2) 或先安装对应大版本的 JRE。`);
   return lines.join('\n');
+}
+
+// ───────────────────────────── 启动期解析（新增） ─────────────────────────────
+
+/** 显式 javaPath 不可用时的错误文案（launch 既有测试逐字断言） */
+export function invalidJavaPathMessage(raw: string): string {
+  return `指定的 javaPath 不可用：${raw}\n请指向 java/javaw 可执行文件，或指向 java home（含 bin/java 的目录）。`;
+}
+
+/**
+ * 同步解析可用 Java，**找不到时返回 null 而不是抛错**。
+ *
+ * 这是给 `GameLauncher` 用的：它需要在「找不到」时先尝试自动下载，
+ * 只有下载也失败才报错。返回 null 让上层能区分这两种情况。
+ *
+ * @param explicitPath `opts.javaPath`；给了就必须可用，否则直接抛错（不自动下载，
+ *                     用户显式指定了路径，静默换成别的 Java 是更差的行为）
+ */
+export function pickJavaOrNull(
+  dataRoot: string,
+  required: JavaRequirement,
+  explicitPath?: string | null,
+): string | null {
+  const raw = explicitPath?.trim() ?? '';
+  if (raw.length > 0) {
+    const p = path.resolve(raw);
+    if (isFile(p)) return p;
+    if (isJavaHome(p)) return javaExecutable(p);
+    throw new Error(invalidJavaPathMessage(raw));
+  }
+
+  const first = findJavaInDataRoot(dataRoot, required)[0];
+  return first === undefined ? null : javaExecutable(first.javaHome);
+}
+
+function isFile(p: string): boolean {
+  try {
+    return fs.statSync(p).isFile();
+  } catch {
+    return false;
+  }
 }
 
 export { JAVA_BIN };

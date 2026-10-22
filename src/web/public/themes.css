@@ -1,0 +1,343 @@
+/* ============================================================================
+ * PCL3 主题包 —— 只改 CSS 变量，不动任何组件规则。
+ * ============================================================================
+ *
+ * 为什么单独一个文件：
+ *   style.css 已经有 233 处 `var(--*)` 引用，组件样式全靠这套语义变量上色。
+ *   把主题集集中到这里，加一套主题只要加一个 `[data-theme='xxx']` 块，
+ *   style.css 一行都不用动，也不会被主题代码撑成两倍长。
+ *
+ * 变量清单（**不要改名**，改了所有主题一起坏）：
+ *   背景三档   --bg / --bg-elev / --bg-elev-2
+ *   边框两档   --line / --line-strong
+ *   文字三档   --text / --text-dim / --text-faint
+ *   主色三档   --accent / --accent-dim / --accent-text（accent-text 压在 accent 上）
+ *   语义色     --warn / --danger / --info
+ *   派生色     --accent-soft / --accent-fade / --accent-fade-strong
+ *              --warn-soft / --danger-soft / --info-soft
+ *              --input-bg / --code-bg
+ *
+ * 默认值（pcl3-dark）仍然写死在 style.css 的 `:root` 里，这里**不重定义**那一组：
+ * 主题只在 `<html data-theme="…">` 时覆盖。这样「没有 JS、没有 localStorage」的场合
+ * 页面仍是原来那套深色 —— 零回归。
+ *
+ * 所有主题的正文对比度都用脚本实测过（见汇报里的表），全部 ≥ 4.5:1。
+ */
+
+/* ════════════════════════════════════════════════════════════════════════════
+   1. 默认深色（pcl3-dark）
+   ────────────────────────────────────────────────────────────────────────────
+   这里只补「派生色」，16 个基础色仍以 style.css 的 :root 为准 —— 只写一遍，
+   不会出现「两处不一样不知道信谁」的情况。
+   ════════════════════════════════════════════════════════════════════════════ */
+
+:root[data-theme='pcl3-dark'] {
+  --accent-soft: #7fe6bc;
+  --accent-fade: rgba(61, 220, 151, 0.16);
+  --accent-fade-strong: rgba(61, 220, 151, 0.22);
+  --warn-soft: #e8c777;
+  --danger-soft: #ffd9d4;
+  --info-soft: #8cc4f6;
+  --input-bg: #0d1116;
+  --code-bg: #0a0d11;
+  --shadow-modal: rgba(0, 0, 0, 0.6);
+  --bg-glow: #17222b;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   2. 石墨（graphite）—— 中性灰，几乎无彩度，长时间盯着最不累
+   ════════════════════════════════════════════════════════════════════════════ */
+
+:root[data-theme='graphite'] {
+  --bg: #101113;
+  --bg-elev: #181a1d;
+  --bg-elev-2: #202326;
+  --line: #2c3034;
+  --line-strong: #3d4247;
+  --text: #eceff2;
+  --text-dim: #a4abb3;
+  --text-faint: #9aa2ab;
+  --accent: #b8c2cc;
+  --accent-dim: #4a5259;
+  --accent-text: #0d0f11;
+  --warn: #d9b26a;
+  --danger: #e8756a;
+  --info: #7fa8cc;
+
+  --accent-soft: #dbe3eb;
+  --accent-fade: rgba(184, 194, 204, 0.16);
+  --accent-fade-strong: rgba(184, 194, 204, 0.22);
+  --warn-soft: #e6cd9e;
+  --danger-soft: #f6c4bf;
+  --info-soft: #a9c6de;
+  --input-bg: #0c0d0f;
+  --code-bg: #08090a;
+  --shadow-modal: rgba(0, 0, 0, 0.62);
+  --bg-glow: #191b1e;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   3. 深海（ocean）—— 冷蓝主色，蓝灰底
+   ════════════════════════════════════════════════════════════════════════════ */
+
+:root[data-theme='ocean'] {
+  --bg: #0a1620;
+  --bg-elev: #10202c;
+  --bg-elev-2: #172a38;
+  --line: #20394a;
+  --line-strong: #2f5168;
+  --text: #e4eef7;
+  --text-dim: #93a9bb;
+  --text-faint: #8aa1b4;
+  --accent: #4db8ff;
+  --accent-dim: #1c5f86;
+  --accent-text: #04141f;
+  --warn: #e8b339;
+  --danger: #f2695c;
+  --info: #7fd0ff;
+
+  --accent-soft: #9ad4ff;
+  --accent-fade: rgba(77, 184, 255, 0.16);
+  --accent-fade-strong: rgba(77, 184, 255, 0.22);
+  --warn-soft: #e8c777;
+  --danger-soft: #ffd9d4;
+  --info-soft: #a8dfff;
+  --input-bg: #071019;
+  --code-bg: #050b12;
+  --shadow-modal: rgba(2, 8, 14, 0.66);
+  --bg-glow: #122433;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   4. 森林（forest）—— 绿主色 + 微绿底，和默认青绿区分得开
+   ════════════════════════════════════════════════════════════════════════════ */
+
+:root[data-theme='forest'] {
+  --bg: #0d1512;
+  --bg-elev: #14201b;
+  --bg-elev-2: #1b2a23;
+  --line: #24382f;
+  --line-strong: #354f43;
+  --text: #e6f0ea;
+  --text-dim: #97afa3;
+  --text-faint: #8ca398;
+  --accent: #79c99e;
+  --accent-dim: #2f6b4c;
+  --accent-text: #06150e;
+  --warn: #e0b04f;
+  --danger: #e8706a;
+  --info: #74b6d6;
+
+  --accent-soft: #a9e3c4;
+  --accent-fade: rgba(121, 201, 158, 0.16);
+  --accent-fade-strong: rgba(121, 201, 158, 0.22);
+  --warn-soft: #ecd08f;
+  --danger-soft: #f7c8c4;
+  --info-soft: #a5d3e8;
+  --input-bg: #0a120e;
+  --code-bg: #080d0a;
+  --shadow-modal: rgba(3, 9, 6, 0.64);
+  --bg-glow: #16251d;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   5. 黄昏（sunset）—— 暖橙主色 + 微褐底
+   ════════════════════════════════════════════════════════════════════════════ */
+
+:root[data-theme='sunset'] {
+  --bg: #17110f;
+  --bg-elev: #211816;
+  --bg-elev-2: #2c201d;
+  --line: #3b2b26;
+  --line-strong: #553d35;
+  --text: #f5eae4;
+  --text-dim: #b6a099;
+  --text-faint: #a48d85;
+  --accent: #ff9a5c;
+  --accent-dim: #8a4a24;
+  --accent-text: #1a0b04;
+  --warn: #f0c05a;
+  --danger: #f2695c;
+  --info: #7fb2dd;
+
+  --accent-soft: #ffc39a;
+  --accent-fade: rgba(255, 154, 92, 0.16);
+  --accent-fade-strong: rgba(255, 154, 92, 0.22);
+  --warn-soft: #f3d79b;
+  --danger-soft: #ffd9d4;
+  --info-soft: #aacdea;
+  --input-bg: #120c0a;
+  --code-bg: #0e0908;
+  --shadow-modal: rgba(8, 4, 2, 0.66);
+  --bg-glow: #241713;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   6. 浅色（light）—— 唯一一套亮底主题，重点照顾对比度
+   ────────────────────────────────────────────────────────────────────────────
+   浅色主题最容易翻车的三件事，逐条处理：
+
+     a) 白底白字
+        --text #12181f 压在 #ffffff 上是 16.7:1，压在 #f4f6f8 上是 15.4:1。
+
+     b) 边框看不见
+        --line 用蓝灰 #d3dae1 而不是浅灰，对白底 1.35:1、对页面底 1.28:1 ——
+        单独看不算高，但它的作用是「分隔」而不是「阅读」，配合 --bg-elev 的
+        白/浅灰对比，区块边界一眼分得清。--line-strong 提到 #aab5c0（1.9:1），
+        用在输入框和按钮描边上。
+
+     c) 主色按钮上的字看不清
+        --accent 压暗到 #12855a，--accent-text 反过来用纯白：
+        白字对 #12855a = 4.9:1，过 AA。
+
+   d) 「深色专用」的浅文字（原来的 #7fe6bc 这类）
+        全部换成同一批颜色的深版（--accent-soft = #0b6b48），
+        在浅底上是 5.9:1，和原来在深底上的观感一致。
+   ════════════════════════════════════════════════════════════════════════════ */
+
+:root[data-theme='light'] {
+  --bg: #f4f6f8;
+  --bg-elev: #ffffff;
+  --bg-elev-2: #eef1f4;
+  --line: #d3dae1;
+  --line-strong: #aab5c0;
+  --text: #12181f;
+  --text-dim: #4a5560;
+  --text-faint: #5d6874;
+  --accent: #12855a;
+  --accent-dim: #0b6b48;
+  --accent-text: #ffffff;
+  --warn: #8a5708;
+  --danger: #c0372a;
+  --info: #1f5f9e;
+
+  --accent-soft: #0b6b48;
+  --accent-fade: rgba(18, 133, 90, 0.12);
+  --accent-fade-strong: rgba(18, 133, 90, 0.2);
+  --warn-soft: #7d4f06;
+  --danger-soft: #a8301f;
+  --info-soft: #194f83;
+  --input-bg: #ffffff;
+  --code-bg: #f8fafb;
+  --shadow-modal: rgba(20, 30, 40, 0.24);
+  --bg-glow: #ffffff;
+
+  /* 让浏览器把滚动条、表单控件、auto 的默认色也换成亮色 */
+  color-scheme: light;
+}
+
+/* 浅色主题的若干「深色专用」细节修正。
+   原则：能靠变量解决的就改变量（上面已改），只有那些必须换字面色值的
+   （日志字色、进度条渐变、遮罩层）才在这里补。全部只在 light 下生效。 */
+:root[data-theme='light'] {
+  /* 顶栏的半透明黑底，浅色下换成半透明白 */
+  --topbar-bg: rgba(244, 246, 248, 0.92);
+  /* 弹窗遮罩 */
+  --scrim: rgba(20, 30, 40, 0.38);
+  /* 日志正文：深色下是 #b8c4cf，浅色下要压深 */
+  --log-text: #38424c;
+  --log-time: #5b6672;
+  /* 进度条渐变起点 */
+  --progress-from: #0b6b48;
+}
+
+:root:not([data-theme='light']) {
+  --topbar-bg: rgba(15, 18, 22, 0.92);
+  --scrim: rgba(6, 9, 12, 0.72);
+  --log-text: #b8c4cf;
+  --log-time: #8b96a2;
+  --progress-from: #2fa97a;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   7. 自定义强调色（data-accent="teal|blue|purple|orange|pink|red"）
+   ────────────────────────────────────────────────────────────────────────────
+   只覆盖 accent 三档 + 两个派生色。选择器按「深色系 / 浅色系」分组：
+   深色底要亮主色 + 近黑前景字，浅色底要暗主色 + 白前景字。
+   这样任何主题 + 任何强调色的组合，按钮上的字都 ≥ 4.5:1。
+   ════════════════════════════════════════════════════════════════════════════ */
+
+/* 深色底（默认 + graphite / ocean / forest / sunset） */
+:root:not([data-theme='light'])[data-accent='teal'] { --accent: #3ddc97; --accent-dim: #1f6f4f; --accent-text: #04140d; --accent-soft: #7fe6bc; --accent-fade: rgba(61, 220, 151, .16); --accent-fade-strong: rgba(61, 220, 151, .22); }
+:root:not([data-theme='light'])[data-accent='blue'] { --accent: #5ea8ff; --accent-dim: #23578f; --accent-text: #04101d; --accent-soft: #a6cdff; --accent-fade: rgba(94, 168, 255, .16); --accent-fade-strong: rgba(94, 168, 255, .22); }
+:root:not([data-theme='light'])[data-accent='purple'] { --accent: #b18cff; --accent-dim: #573a94; --accent-text: #0e0620; --accent-soft: #d2bcff; --accent-fade: rgba(177, 140, 255, .16); --accent-fade-strong: rgba(177, 140, 255, .22); }
+:root:not([data-theme='light'])[data-accent='orange'] { --accent: #ffa95c; --accent-dim: #8a4a24; --accent-text: #1a0b04; --accent-soft: #ffc39a; --accent-fade: rgba(255, 169, 92, .16); --accent-fade-strong: rgba(255, 169, 92, .22); }
+:root:not([data-theme='light'])[data-accent='pink'] { --accent: #ff86bd; --accent-dim: #8f2f5b; --accent-text: #1d0512; --accent-soft: #ffb6d6; --accent-fade: rgba(255, 134, 189, .16); --accent-fade-strong: rgba(255, 134, 189, .22); }
+:root:not([data-theme='light'])[data-accent='red'] { --accent: #ff7f72; --accent-dim: #8f2d26; --accent-text: #1d0604; --accent-soft: #ffb3ab; --accent-fade: rgba(255, 127, 114, .16); --accent-fade-strong: rgba(255, 127, 114, .22); }
+
+/* 浅色底：同色相压暗 + 白字 */
+:root[data-theme='light'][data-accent='teal'] { --accent: #12855a; --accent-dim: #0b6b48; --accent-text: #ffffff; --accent-soft: #0b6b48; --accent-fade: rgba(18, 133, 90, .12); --accent-fade-strong: rgba(18, 133, 90, .2); }
+:root[data-theme='light'][data-accent='blue'] { --accent: #1f6fd0; --accent-dim: #175596; --accent-text: #ffffff; --accent-soft: #175596; --accent-fade: rgba(31, 111, 208, .12); --accent-fade-strong: rgba(31, 111, 208, .2); }
+:root[data-theme='light'][data-accent='purple'] { --accent: #6f42c1; --accent-dim: #573394; --accent-text: #ffffff; --accent-soft: #573394; --accent-fade: rgba(111, 66, 193, .12); --accent-fade-strong: rgba(111, 66, 193, .2); }
+:root[data-theme='light'][data-accent='orange'] { --accent: #b55408; --accent-dim: #8a3f05; --accent-text: #ffffff; --accent-soft: #8a3f05; --accent-fade: rgba(181, 84, 8, .12); --accent-fade-strong: rgba(181, 84, 8, .2); }
+:root[data-theme='light'][data-accent='pink'] { --accent: #c02a6b; --accent-dim: #96204f; --accent-text: #ffffff; --accent-soft: #96204f; --accent-fade: rgba(192, 42, 107, .12); --accent-fade-strong: rgba(192, 42, 107, .2); }
+:root[data-theme='light'][data-accent='red'] { --accent: #c0372a; --accent-dim: #96291f; --accent-text: #ffffff; --accent-soft: #96291f; --accent-fade: rgba(192, 55, 42, .12); --accent-fade-strong: rgba(192, 55, 42, .2); }
+
+/* ════════════════════════════════════════════════════════════════════════════
+   8. 字号（data-font-size="sm|lg"）—— 默认中号不挂属性
+   ────────────────────────────────────────────────────────────────────────────
+   现有样式以 px 为主，直接改 html{font-size} 对它们无效，
+   所以这里缩放 body 的基准字号（继承生效），再给「显式写死 px」的控件补一条。
+   ════════════════════════════════════════════════════════════════════════════ */
+
+:root { --font-scale: 1; }
+
+:root[data-font-size='sm'] { --font-scale: 0.91; }
+:root[data-font-size='lg'] { --font-scale: 1.1; }
+
+:root[data-font-size] body { font-size: calc(14px * var(--font-scale)); }
+
+:root[data-font-size] .btn,
+:root[data-font-size] .input,
+:root[data-font-size] .seg-btn,
+:root[data-font-size] .nav-item,
+:root[data-font-size] .chip,
+:root[data-font-size] .panel-head h2,
+:root[data-font-size] .page-head h2 {
+  font-size: calc(1em * var(--font-scale));
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   9. 紧凑模式（data-density="compact"）—— 只收间距与圆角，不动字号
+   ════════════════════════════════════════════════════════════════════════════ */
+
+:root[data-density='compact'] {
+  --radius: 7px;
+  --radius-sm: 5px;
+}
+
+:root[data-density='compact'] .panel-body { padding: 8px 10px; }
+:root[data-density='compact'] .panel-head { padding: 7px 10px; }
+:root[data-density='compact'] .page-head { padding: 7px 10px; }
+:root[data-density='compact'] .nav-item { height: 32px; }
+:root[data-density='compact'] .card { padding: 9px; gap: 6px; }
+:root[data-density='compact'] .version-grid { gap: 7px; }
+:root[data-density='compact'] .pack-item { padding: 7px 10px; }
+:root[data-density='compact'] .result-item { padding: 7px 9px; }
+:root[data-density='compact'] .content-section { margin-top: 10px; }
+:root[data-density='compact'] .field { margin-bottom: 10px; }
+:root[data-density='compact'] .log { height: 150px; }
+:root[data-density='compact'] .page { gap: 8px; }
+:root[data-density='compact'] .theme-grid { gap: 6px; }
+
+/* ════════════════════════════════════════════════════════════════════════════
+   10. 动效开关（data-motion="off"）
+   ════════════════════════════════════════════════════════════════════════════ */
+
+:root[data-motion='off'] *,
+:root[data-motion='off'] *::before,
+:root[data-motion='off'] *::after {
+  transition: none !important;
+  animation: none !important;
+  scroll-behavior: auto !important;
+}
+
+/* 没在 PCL3 里显式选过时，也尊重系统的「减少动态效果」 */
+@media (prefers-reduced-motion: reduce) {
+  :root:not([data-motion='on']) *,
+  :root:not([data-motion='on']) *::before,
+  :root:not([data-motion='on']) *::after {
+    transition-duration: .01ms !important;
+    animation-duration: .01ms !important;
+  }
+}

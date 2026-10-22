@@ -12,3 +12,6 @@
 *.jpg  binary
 *.ico  binary
 *.jar  binary
+*.css  text eol=lf
+*.html text eol=lf
+*.png  binary

@@ -5,7 +5,7 @@
  */
 
 export { GameLauncher, DEFAULT_MEMORY_MB, libraryJarRelativePath } from './launcher.js';
-export type { GameLauncherDeps, LaunchContext, LaunchedProcess } from './launcher.js';
+export type { GameLauncherDeps, JavaProvisionerLike, LaunchContext, LaunchedProcess } from './launcher.js';
 
 export {
   KNOWN_PLACEHOLDERS,
@@ -40,8 +40,29 @@ export type { NativeExtractJob, NativeExtractResult } from './natives.js';
 export { openZip } from './zip.js';
 export type { ZipArchive, ZipEntry } from './zip.js';
 
-export { findJavaInDataRoot, isJavaHome, javaExecutable, parseMajorVersion } from './java.js';
+export {
+  findJavaInDataRoot,
+  invalidJavaPathMessage,
+  isJavaHome,
+  javaExecutable,
+  noJavaMessage,
+  parseMajorVersion,
+  pickJavaOrNull,
+} from './java.js';
 export type { JavaLookup, JavaRequirement } from './java.js';
+
+export {
+  JavaAutoProvisioner,
+  JavaProvisionError,
+  classifyProvisionError,
+  humanizeProvisionError,
+} from './java-provision.js';
+export type {
+  JavaInstallerLike,
+  JavaProvisionerDeps,
+  JavaProvisionFailureKind,
+  JavaProvisionProgress,
+} from './java-provision.js';
 
 export { mavenRelativePath, parseMavenCoordinate } from './maven.js';
 export { libraryKey, mergeVersionJson } from './version-merge.js';

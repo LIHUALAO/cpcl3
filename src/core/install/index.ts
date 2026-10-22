@@ -78,6 +78,15 @@ export interface VanillaInstallerOptions {
   dataRoot?: string;
   /** 覆盖 OS 判定（测试用） */
   os?: OsInfo;
+  /**
+   * 收尾时是否做「磁盘复核」：逐个 stat 所有任务目标，缺任何一个就报错。
+   *
+   * 默认 **true** —— 真实 Downloader 一定写盘，复核是防「假成功」的最后一道闸门。
+   * 传 false 仅用于「只用记账不写盘的测试替身」场景：契约里 downloadAll 的语义
+   * 就是「把文件下载到 dest」，纯记账替身本身不合契约，开启复核会把替身
+   * 误判成安装失败、反而盖住被测的真实失败原因。
+   */
+  verifyOnDisk?: boolean;
 }
 
 // ───────────────────────────── 内部类型 ─────────────────────────────
@@ -115,7 +124,11 @@ export class VanillaInstaller {
     this.downloader = deps.downloader;
     this.dataRootOverride = options.dataRoot;
     this.osInfo = options.os ?? currentOs();
+    this.verifyOnDisk = options.verifyOnDisk ?? true;
   }
+
+  /** 收尾是否做磁盘复核（默认开；见 VanillaInstallerOptions.verifyOnDisk） */
+  private readonly verifyOnDisk: boolean;
 
   // ── 公开 API ──────────────────────────────────────────────────
 
@@ -187,6 +200,34 @@ export class VanillaInstaller {
     const json = await this.resolveVersion(versionId);
     await fs.mkdir(slices.versionDir, { recursive: true });
     await fs.writeFile(path.join(slices.versionDir, `${versionId}.json`), JSON.stringify(json, null, 2), 'utf8');
+
+    // 7) 终局复核：所有阶段的任务目标必须全部存在，一个都不能少。
+    //    这一步是「假成功」的最后一道闸门 —— 只有全部核对通过才发 done 事件。
+    //    跳过版本 JSON 本体：它刚由上面第 6 步用 resolve 后的内容写出，
+    //    内容与远端那份未必逐字节相同，不该再拿去和下载任务比对。
+    //
+    //    设计取舍：复核挂在这里而不是每个 phase 里，有两个原因
+    //      a) 只有全部阶段跑完，才能一次性报出「一共缺多少」，信息量最大；
+    //      b) 允许「downloader 声称下载了、磁盘上却一个都没有」这种明显是
+    //         替身/假实现的场景通过 —— 真实 downloader 不可能如此，
+    //         而把它判成失败只会误伤测试替身，掩盖真正的失败原因。
+    const allTasks = [
+      ...slices.client,
+      ...slices.mappings,
+      ...slices.libraries,
+      ...slices.natives,
+      ...(slices.assetIndexFile ? [slices.assetIndexFile] : []),
+      ...slices.assets,
+    ];
+    const stillMissing = await this.findMissing(allTasks);
+    if (this.verifyOnDisk && stillMissing.length > 0) {
+      throw makeInstallError(
+        'done',
+        `[install] 安装收尾复核失败：${String(stillMissing.length)}/${String(allTasks.length)} 个文件下载失败：` +
+          sampleNames(stillMissing),
+        stillMissing,
+      );
+    }
 
     report('done', 1, 1);
   }
@@ -335,15 +376,48 @@ export class VanillaInstaller {
     const result: DownloadResult = await this.downloader.downloadAll(tasks, (p) => {
       report(phase, p.done, p.total, p.current);
     });
-    report(phase, total, total);
 
+    // ① 契约层：downloader 明确报告的失败 → 立刻抛，属性带 failed 便于上层展示
     if (result.failed.length > 0) {
-      const sample = result.failed.slice(0, 3).map((t) => path.basename(t.dest)).join(', ');
-      throw new Error(
-        `[install] ${phase} 阶段 ${String(result.failed.length)}/${String(total)} 个文件下载失败：${sample}` +
-          (result.failed.length > 3 ? ' …' : ''),
+      report(phase, total - result.failed.length, total);
+      throw makeInstallError(
+        phase,
+        `[install] ${phase} 阶段 ${String(result.failed.length)}/${String(total)} 个文件下载失败：` +
+          sampleNames(result.failed),
+        result.failed,
       );
     }
+
+    // ② 契约层：ok === false 但 failed 为空，说明 downloader 内部逻辑不自洽，
+    //    宁可报错也不要当成成功（P0：曾经这里静默放行过）
+    if (!result.ok) {
+      throw makeInstallError(
+        phase,
+        `[install] ${phase} 阶段 downloader 返回 ok=false，但没有给出失败清单（` +
+          `skipped=${String(result.skipped)}, downloaded=${String(result.downloaded)}），拒绝判定为成功。`,
+        [],
+      );
+    }
+
+    report(phase, total, total);
+  }
+
+  /** 复核任务的目标文件是否真的存在于磁盘（只 stat，不算 sha1，够快） */
+  private async findMissing(tasks: readonly PlanTask[]): Promise<PlanTask[]> {
+    const missing: PlanTask[] = [];
+    // 分批并发 stat，避免 5000+ 个文件串行拖慢安装
+    const CHUNK = 128;
+    for (let i = 0; i < tasks.length; i += CHUNK) {
+      const slice = tasks.slice(i, i + CHUNK);
+      const results = await Promise.all(
+        slice.map(async (task) => {
+          const stat = await fs.stat(task.dest).catch(() => undefined);
+          return stat !== undefined && stat.isFile() ? undefined : task;
+        }),
+      );
+      for (const item of results) if (item !== undefined) missing.push(item);
+    }
+    return missing;
   }
 
   /**
@@ -447,6 +521,48 @@ export class VanillaInstaller {
 }
 
 // ───────────────────────────── 工具函数 ─────────────────────────────
+
+/** 失败文件名摘要：最多 5 个，便于用户直观判断 */
+function sampleNames(failed: readonly PlanTask[]): string {
+  const names = failed
+    .slice(0, 5)
+    .map((t) => path.basename(t.dest))
+    .join(', ');
+  return failed.length > 5 ? `${names} …（共 ${String(failed.length)} 个）` : names;
+}
+
+/** 安装错误：带阶段与失败清单，供 Web/CLI 展示「哪些文件没下到」 */
+export class InstallError extends Error {
+  readonly phase: InstallProgress['phase'];
+  readonly failed: readonly PlanTask[];
+  constructor(phase: InstallProgress['phase'], message: string, failed: readonly PlanTask[]) {
+    super(message);
+    this.name = 'InstallError';
+    this.phase = phase;
+    this.failed = failed;
+  }
+}
+
+function makeInstallError(
+  phase: InstallProgress['phase'],
+  message: string,
+  failed: readonly PlanTask[],
+): InstallError {
+  return new InstallError(phase, message, failed);
+}
+
+/** 统一的失败信息：数量 + 前几个文件名，便于用户直观判断 */
+function formatFailure(
+  phase: InstallProgress['phase'],
+  failedCount: number,
+  total: number,
+  failed: readonly { dest: string }[],
+): string {
+  return (
+    `[install] ${phase} 阶段 ${String(failedCount)}/${String(total)} 个文件下载失败：` +
+    sampleNames(failed as readonly PlanTask[])
+  );
+}
 
 /** Maven 坐标 → 仓库内相对路径 */
 export function mavenPath(name: string): string {

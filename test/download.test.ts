@@ -20,7 +20,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import os from 'node:os';
@@ -40,6 +40,7 @@ import {
   TransportError,
 } from '../src/core/download/index.js';
 import { backoffDelay } from '../src/core/download/fetcher.js';
+import type { fetchOne } from '../src/core/download/fetcher.js';
 import type { DownloadProgress, DownloadTask } from '../src/core/types.js';
 
 // ───────────────────────────── 测试工具 ─────────────────────────────
@@ -809,6 +810,150 @@ describe('重定向跟随', () => {
         await target.close();
       }
     }
+  });
+});
+
+// ───────────────────── 8.5 worker 抛异常必须计入 failed ─────────────────────
+
+/**
+ * 这一组是 P0 回归测试。
+ *
+ * 曾经的 bug：`Downloader.downloadAll` 写的是
+ *     `await runPool(tasks, concurrency, worker)` —— 返回值被丢弃，
+ * `runPool` 把 worker 的异常收进 `errors[]` 而不重抛，
+ * 于是抛异常的那个任务既不算 skipped / downloaded，也不进 failed，
+ * 从统计里**凭空蒸发**。`install()` 看一眼 `failed.length === 0` 就宣布成功，
+ * 磁盘上却缺文件 —— 假成功。
+ *
+ * 修复要求：任何 worker 异常都必须折算成 failed，且
+ * `skipped + downloaded + failed.length === tasks.length` 恒成立。
+ */
+describe('worker 抛异常必须计入 failed（P0 回归）', () => {
+  /**
+   * 造一个「按 URL 决定行为」的 fetchOne 替身。
+   * 真实世界里 worker 抛异常对应的是 TLS 超时被上层重抛、磁盘 IO 异常、
+   * 编码错误这类 `fetchOne` 没兜住的路径。
+   */
+  function stubFetchOne(behaviour: (task: DownloadTask) => 'ok' | 'throw' | 'fail'): typeof fetchOne {
+    return (async (task: DownloadTask) => {
+      const mode = behaviour(task);
+      if (mode === 'throw') throw new Error(`simulated worker crash for ${task.dest}`);
+      if (mode === 'fail') return { outcome: 'failed' as const, error: new Error('simulated fail') };
+      await mkdir(path.dirname(task.dest), { recursive: true }).catch(() => undefined);
+      await writeFile(task.dest, 'ok').catch(() => undefined);
+      return { outcome: 'downloaded' as const, bytes: 2 };
+    }) as typeof fetchOne;
+  }
+
+  it('单个任务在 worker 内抛异常 → failed=1、ok=false，且任务数守恒', async () => {
+    const dir = await makeDir('worker-throw');
+    const dest = path.join(dir, 'a.bin');
+
+    const dl = new Downloader({
+      concurrency: 4,
+      retries: 1,
+      mirrors: [],
+      fetchOneFn: stubFetchOne(() => 'throw'),
+    });
+    const res = await dl.downloadAll([{ url: 'http://example.invalid/a', dest }]);
+
+    assert.equal(res.ok, false, '有任务失败时 ok 必须为 false');
+    assert.equal(res.failed.length, 1, '抛异常的任务必须进 failed，而不是消失');
+    assert.equal(
+      res.skipped + res.downloaded + res.failed.length,
+      1,
+      '任务数必须守恒：skipped + downloaded + failed === total',
+    );
+    assert.equal(existsSync(dest), false);
+  });
+
+  it('混合场景：成功 + 返回 failed + worker 抛异常 → 三项计数之和等于总数', async () => {
+    const dir = await makeDir('worker-mixed');
+    const okDest = path.join(dir, 'good.bin');
+    const failDest = path.join(dir, 'bad.bin');
+    const boomDest = path.join(dir, 'boom.bin');
+
+    const dl = new Downloader({
+      concurrency: 3,
+      retries: 1,
+      mirrors: [],
+      fetchOneFn: stubFetchOne((task) => {
+        if (task.dest === okDest) return 'ok';
+        if (task.dest === failDest) return 'fail';
+        return 'throw';
+      }),
+    });
+
+    const tasks: DownloadTask[] = [
+      { url: 'http://example.invalid/1', dest: okDest },
+      { url: 'http://example.invalid/2', dest: failDest },
+      { url: 'http://example.invalid/3', dest: boomDest },
+    ];
+
+    const res = await dl.downloadAll(tasks);
+
+    assert.equal(res.downloaded, 1, '正常任务应计入 downloaded');
+    assert.equal(res.failed.length, 2, '返回 failed 与抛异常都应计入 failed');
+    assert.equal(
+      res.skipped + res.downloaded + res.failed.length,
+      tasks.length,
+      '任务数必须守恒，不允许有任务蒸发',
+    );
+    assert.equal(res.ok, false);
+    assert.equal(existsSync(okDest), true, '成功的那一个必须真的落盘');
+  });
+
+  it('全部抛异常 → 每个任务都出现在 failed 里（一个都不能少）', async () => {
+    const dir = await makeDir('worker-all-throw');
+    const dl = new Downloader({
+      concurrency: 8,
+      retries: 1,
+      mirrors: [],
+      fetchOneFn: stubFetchOne(() => 'throw'),
+    });
+    const tasks: DownloadTask[] = [];
+    for (let i = 0; i < 16; i++) {
+      tasks.push({ url: `http://example.invalid/${String(i)}`, dest: path.join(dir, `f${String(i)}.bin`) });
+    }
+
+    const res = await dl.downloadAll(tasks);
+
+    assert.equal(res.failed.length, tasks.length, '16 个任务全炸，failed 必须也是 16');
+    assert.equal(res.skipped + res.downloaded + res.failed.length, tasks.length);
+    assert.equal(res.ok, false);
+  });
+
+  it('高并发下部分抛异常：failed 数与被注入的异常数严格相等', async () => {
+    const dir = await makeDir('worker-concurrent');
+    const tasks: DownloadTask[] = [];
+    for (let i = 0; i < 40; i++) {
+      tasks.push({ url: `http://example.invalid/${String(i)}`, dest: path.join(dir, `c${String(i)}.bin`) });
+    }
+    // 每 3 个炸一个，共 14 个（i % 3 === 0 → 0,3,...,39）
+    const expectedCrashes = tasks.filter((_, i) => i % 3 === 0).length;
+
+    const dl = new Downloader({
+      concurrency: 8,
+      retries: 1,
+      mirrors: [],
+      fetchOneFn: stubFetchOne((task) => {
+        const n = Number(/(\d+)\.bin$/.exec(task.dest)?.[1] ?? '-1');
+        return n % 3 === 0 ? 'throw' : 'ok';
+      }),
+    });
+
+    const res = await dl.downloadAll(tasks);
+
+    assert.equal(res.failed.length, expectedCrashes, `应有 ${String(expectedCrashes)} 个失败`);
+    assert.equal(res.downloaded, tasks.length - expectedCrashes);
+    assert.equal(res.skipped + res.downloaded + res.failed.length, tasks.length);
+  });
+
+  it('空任务列表：ok=true 且计数为 0', async () => {
+    const dl = new Downloader({ concurrency: 4 });
+    const res = await dl.downloadAll([]);
+    assert.equal(res.ok, true);
+    assert.equal(res.skipped + res.downloaded + res.failed.length, 0);
   });
 });
 

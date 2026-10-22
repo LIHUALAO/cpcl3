@@ -623,6 +623,9 @@ test('javaPath：未指定且数据目录里没有对应 JRE 时抛出明确错�
     versionRepo: new FakeVersionRepo({ '1.21.4': version121() }),
     dataRoot,
     platform: WINDOWS,
+    // 关掉自动下载（javaProvisioner: null）——本用例只断言「没有可用 Java 时的错误文案」，
+    // 自动下载路径由 java.test.ts 的接线用例单独覆盖。
+    javaProvisioner: null,
   });
 
   await assert.rejects(
@@ -818,7 +821,8 @@ test('inheritsFrom：resolveInherited 合并后父版本参数与库都在', asy
     account: OFFLINE,
   });
 
-  assert.deepEqual(repo.requests, ['1.21.4-forge-1', '1.21.4'], '应解析继承链');
+  // 继承链被解析过即可（P0 修复后还会额外取一次未合并 JSON 来定位 jar，属正常）
+  assert.ok(repo.requests.includes('1.21.4-forge-1') && repo.requests.includes('1.21.4'), '应解析继承链');
   assert.ok(cmd.args.includes('cpw.mods.bootstraplauncher.BootstrapLauncher'));
   assert.ok(!cmd.args.includes('net.minecraft.client.main.Main'), '子版本的 mainClass 应覆盖父版本');
   assert.equal(findArg(cmd.args, '--username'), 'Steve', '父版本的 game 参数应保留');
@@ -827,9 +831,231 @@ test('inheritsFrom：resolveInherited 合并后父版本参数与库都在', asy
   const entries = (cmd.args[cmd.args.indexOf('-cp') + 1] as string).split(';');
   assert.ok(entries.some((e) => e.includes('forge-1.21.4-1.jar')), '子版本的库应进 classpath');
   assert.ok(entries.some((e) => e.includes('guava-33.3.1-jre.jar')), '父版本的库应进 classpath');
+  // ⚠ 语义变更（P0 修复）：classpath 最后一项是**真正持有 jar 的版本**。
+  // makeEnv 不创建任何 .jar，链上谁都没有 jar，于是回退到 realVersionId（= 子版本）。
+  // 有 jar 的场景见下方「client jar 解析」一组测试。
   assert.equal(entries[entries.length - 1], path.join(env.dataRoot, 'versions', '1.21.4-forge-1', '1.21.4-forge-1.jar'));
 
   fs.rmSync(env.dataRoot, { recursive: true, force: true });
+});
+
+// ─────────────────────── 测试：client jar 解析（P0：加载器版本没有自己的 jar） ───────────────────────
+
+/** 写一个版本目录：<root>/versions/<id>/<id>.json（可选同时建 .jar） */
+function writeVersionDir(dataRoot: string, json: VersionJson, withJar: boolean): void {
+  const dir = path.join(dataRoot, 'versions', json.id);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${json.id}.json`), JSON.stringify(json, null, 2), 'utf8');
+  if (withJar) fs.writeFileSync(path.join(dir, `${json.id}.jar`), 'fake-jar', 'utf8');
+}
+
+/** 加载器版本的 profile：只有 json，没有 jar */
+function loaderProfile(gameVersion: string, loaderId: string): VersionJson {
+  return {
+    id: loaderId,
+    type: 'release',
+    mainClass: 'net.fabricmc.loader.impl.launch.knot.KnotClient',
+    assets: '',
+    inheritsFrom: gameVersion,
+    libraries: [
+      lib('net.fabricmc:fabric-loader:0.19.5', 'net/fabricmc/fabric-loader/0.19.5/fabric-loader-0.19.5.jar'),
+    ],
+    arguments: { game: [], jvm: ['-DFabricMcEmu= net.minecraft.client.main.Main '] },
+    javaVersion: { component: 'java-runtime-delta', majorVersion: 21 },
+  };
+}
+
+test('P0：加载器版本无 jar 时，classpath 末项必须指向 inheritsFrom 原版的 jar', async () => {
+  const env = makeEnv('loaderjar');
+  const loaderId = 'fabric-loader-0.19.5-1.21.4';
+  // 原版：有 jar
+  writeVersionDir(env.dataRoot, version121(), true);
+  // 加载器：只有 json
+  const profile = loaderProfile('1.21.4', loaderId);
+  writeVersionDir(env.dataRoot, profile, false);
+
+  const launcher = new GameLauncher({
+    versionRepo: new FakeVersionRepo({ '1.21.4': version121(), [loaderId]: profile }),
+    dataRoot: env.dataRoot,
+    platform: WINDOWS,
+  });
+
+  const cmd = await launcher.buildCommand({ versionId: loaderId, instanceDir: env.instanceDir, account: OFFLINE });
+  const entries = (cmd.args[cmd.args.indexOf('-cp') + 1] as string).split(';');
+  const last = entries[entries.length - 1] as string;
+
+  assert.equal(
+    last,
+    path.join(env.dataRoot, 'versions', '1.21.4', '1.21.4.jar'),
+    'classpath 末项应是原版 1.21.4 的 jar，而不是不存在的加载器 jar',
+  );
+  assert.ok(!last.includes(loaderId), '绝不能引用加载器版本自己的 jar（它不存在）');
+  assert.ok(fs.existsSync(last), 'classpath 末项必须是真实存在的文件');
+
+  // mainClass 仍是加载器的
+  assert.ok(cmd.args.includes('net.fabricmc.loader.impl.launch.knot.KnotClient'));
+  // 资产索引跟随原版
+  assert.equal(findArg(cmd.args, '--assetIndex'), '17', '资产索引必须来自原版');
+
+  fs.rmSync(env.dataRoot, { recursive: true, force: true });
+});
+
+test('P0：加载器版本自己有 jar 时仍用自己的（不误伤原版直接启动）', async () => {
+  const env = makeEnv('ownjar');
+  writeVersionDir(env.dataRoot, version121(), true);
+
+  const launcher = new GameLauncher({
+    versionRepo: new FakeVersionRepo({ '1.21.4': version121() }),
+    dataRoot: env.dataRoot,
+    platform: WINDOWS,
+  });
+  const cmd = await launcher.buildCommand({ versionId: '1.21.4', instanceDir: env.instanceDir, account: OFFLINE });
+  const entries = (cmd.args[cmd.args.indexOf('-cp') + 1] as string).split(';');
+  assert.equal(entries[entries.length - 1], path.join(env.dataRoot, 'versions', '1.21.4', '1.21.4.jar'));
+
+  fs.rmSync(env.dataRoot, { recursive: true, force: true });
+});
+
+test('P0：多层继承链（loader → 中间层 → 原版 jar）能一路找到 jar', async () => {
+  const env = makeEnv('chain');
+  writeVersionDir(env.dataRoot, version121(), true);
+
+  const mid: VersionJson = {
+    id: 'mid-layer',
+    type: 'release',
+    mainClass: 'net.minecraft.client.main.Main',
+    assets: '17',
+    inheritsFrom: '1.21.4',
+    libraries: [],
+  };
+  writeVersionDir(env.dataRoot, mid, false);
+
+  const top: VersionJson = {
+    ...loaderProfile('mid-layer', 'quilt-loader-0.30.1-1.21.4'),
+    id: 'quilt-loader-0.30.1-1.21.4',
+    inheritsFrom: 'mid-layer',
+  };
+  writeVersionDir(env.dataRoot, top, false);
+
+  const launcher = new GameLauncher({
+    versionRepo: new FakeVersionRepo({
+      '1.21.4': version121(),
+      'mid-layer': mid,
+      'quilt-loader-0.30.1-1.21.4': top,
+    }),
+    dataRoot: env.dataRoot,
+    platform: WINDOWS,
+  });
+
+  const cmd = await launcher.buildCommand({
+    versionId: 'quilt-loader-0.30.1-1.21.4',
+    instanceDir: env.instanceDir,
+    account: OFFLINE,
+  });
+  const entries = (cmd.args[cmd.args.indexOf('-cp') + 1] as string).split(';');
+  assert.equal(
+    entries[entries.length - 1],
+    path.join(env.dataRoot, 'versions', '1.21.4', '1.21.4.jar'),
+    '应跳过中间层，找到真正有 jar 的祖先',
+  );
+
+  fs.rmSync(env.dataRoot, { recursive: true, force: true });
+});
+
+test('P0：整条链都没有 jar 时回退到自身 id（不抛错，保留旧行为）', async () => {
+  const env = makeEnv('nojar');
+  const loaderId = 'fabric-loader-x-1.21.4';
+  writeVersionDir(env.dataRoot, version121(), false);
+  writeVersionDir(env.dataRoot, loaderProfile('1.21.4', loaderId), false);
+
+  const launcher = new GameLauncher({
+    versionRepo: new FakeVersionRepo({ '1.21.4': version121(), [loaderId]: loaderProfile('1.21.4', loaderId) }),
+    dataRoot: env.dataRoot,
+    platform: WINDOWS,
+  });
+  const cmd = await launcher.buildCommand({ versionId: loaderId, instanceDir: env.instanceDir, account: OFFLINE });
+  const entries = (cmd.args[cmd.args.indexOf('-cp') + 1] as string).split(';');
+  assert.equal(entries[entries.length - 1], path.join(env.dataRoot, 'versions', loaderId, `${loaderId}.jar`));
+
+  fs.rmSync(env.dataRoot, { recursive: true, force: true });
+});
+
+test('P0：资产索引跟随原版（加载器 assets 为空串时不使用它）', async () => {
+  const env = makeEnv('assets');
+  const loaderId = 'fabric-loader-0.19.5-1.21.4';
+  writeVersionDir(env.dataRoot, version121(), true);
+  const profile = loaderProfile('1.21.4', loaderId);
+  profile.assets = ''; // 加载器 profile 的 assets 是空串（真实情况）
+  writeVersionDir(env.dataRoot, profile, false);
+
+  const launcher = new GameLauncher({
+    versionRepo: new FakeVersionRepo({ '1.21.4': version121(), [loaderId]: profile }),
+    dataRoot: env.dataRoot,
+    platform: WINDOWS,
+  });
+  const cmd = await launcher.buildCommand({ versionId: loaderId, instanceDir: env.instanceDir, account: OFFLINE });
+  assert.equal(findArg(cmd.args, '--assetsIndex') ?? findArg(cmd.args, '--assetIndex'), '17');
+
+  fs.rmSync(env.dataRoot, { recursive: true, force: true });
+});
+
+// ─────────────────── 测试：libraries 合并必须区分 classifier（P0：jtracy 主 jar 丢失） ───────────────────
+
+test('P0：合并时 classifier 不同的库必须同时保留（jtracy 主 jar 不能被 natives 覆盖）', async () => {
+  const { mergeVersionJson } = await import('../src/core/launch/version-merge.js');
+
+  const parent: VersionJson = {
+    id: '26.3',
+    type: 'release',
+    mainClass: 'net.minecraft.client.main.Main',
+    assets: '17',
+    libraries: [
+      lib('com.mojang:jtracy:1.14.38', 'com/mojang/jtracy/1.14.38/jtracy-1.14.38.jar'),
+      lib('com.mojang:jtracy:1.14.38:natives-windows', 'com/mojang/jtracy/1.14.38/jtracy-1.14.38-natives-windows.jar', {
+        rules: [{ action: 'allow', os: { name: 'windows' } }],
+      }),
+    ],
+  };
+  const child: VersionJson = {
+    id: 'fabric-loader-0.19.5-26.3',
+    type: 'release',
+    mainClass: 'net.fabricmc.loader.impl.launch.knot.KnotClient',
+    assets: '',
+    inheritsFrom: '26.3',
+    libraries: [lib('net.fabricmc:fabric-loader:0.19.5', 'net/fabricmc/fabric-loader/0.19.5/fabric-loader-0.19.5.jar')],
+  };
+
+  const merged = mergeVersionJson(parent, child);
+  const names = (merged.libraries ?? []).map((l) => l.name);
+
+  assert.ok(names.includes('com.mojang:jtracy:1.14.38'), 'jtracy 主 jar 必须保留（缺失会 NoClassDefFoundError）');
+  assert.ok(names.includes('com.mojang:jtracy:1.14.38:natives-windows'), 'jtracy natives 也必须保留');
+  assert.ok(names.includes('net.fabricmc:fabric-loader:0.19.5'), '子版本库也要在');
+});
+
+test('P0：同 group:artifact 且同 classifier 时仍由子版本覆盖（版本升级语义不变）', async () => {
+  const { mergeVersionJson } = await import('../src/core/launch/version-merge.js');
+
+  const parent: VersionJson = {
+    id: '1.21.4',
+    type: 'release',
+    mainClass: 'net.minecraft.client.main.Main',
+    assets: '17',
+    libraries: [lib('com.google.guava:guava:33.3.1-jre', 'com/google/guava/guava/33.3.1-jre/guava-33.3.1-jre.jar')],
+  };
+  const child: VersionJson = {
+    id: 'child',
+    type: 'release',
+    mainClass: 'X',
+    assets: '',
+    inheritsFrom: '1.21.4',
+    libraries: [lib('com.google.guava:guava:33.4.0-jre', 'com/google/guava/guava/33.4.0-jre/guava-33.4.0-jre.jar')],
+  };
+
+  const merged = mergeVersionJson(parent, child);
+  const guavas = (merged.libraries ?? []).filter((l) => l.name.startsWith('com.google.guava:guava'));
+  assert.equal(guavas.length, 1, '同分类的同名库应只剩一条');
+  assert.equal(guavas[0]?.name, 'com.google.guava:guava:33.4.0-jre', '子版本应覆盖父版本');
 });
 
 // ───────────────────────────── 测试：launch() 真的 spawn ─────────────────────────────
@@ -899,4 +1125,497 @@ test('launch()：真 spawn（假 java = node 的 exe 副本），并验证 args 
   }
 
   fs.rmSync(env.dataRoot, { recursive: true, force: true });
+});
+
+// ═════════════════ 测试：首次启动默认中文（options.txt + JVM locale） ═════════════════
+
+test('options.txt：不存在时生成，且含 lang:zh_cn', async () => {
+  const env = makeEnv('opt-create');
+  const optFile = path.join(env.instanceDir, 'options.txt');
+  assert.ok(!fs.existsSync(optFile), '前置条件：一开始不该有 options.txt');
+
+  const launcher = new GameLauncher({
+    versionRepo: new FakeVersionRepo({ '1.21.4': version121() }),
+    dataRoot: env.dataRoot,
+    platform: WINDOWS,
+  });
+  await launcher.buildCommand({ versionId: '1.21.4', instanceDir: env.instanceDir, account: OFFLINE });
+
+  assert.ok(fs.existsSync(optFile), 'buildCommand 后应生成 options.txt');
+  const raw = fs.readFileSync(optFile, 'utf8');
+  const content = raw.replace(/\r\n/g, '\n');
+
+  assert.match(content, /^lang:zh_cn$/m, '必须含 lang:zh_cn');
+  assert.ok(content.startsWith('version:1.0\n'), '首行应是 version:1.0');
+  assert.match(content, /^renderDistance:12$/m);
+  assert.match(content, /^guiScale:0$/m);
+  assert.match(content, /^autoJump:false$/m);
+
+  // 格式约束：无 BOM、无冒号后空格、LF 换行
+  assert.notEqual(raw.charCodeAt(0), 0xfeff, '不能有 BOM');
+  assert.ok(!content.includes(': '), 'key:value 之间不能有空格');
+  assert.ok(!raw.includes('\r\n'), '本项目约定 LF 换行');
+
+  fs.rmSync(env.dataRoot, { recursive: true, force: true });
+});
+
+test('options.txt：已存在但无 lang 行 → 追加 lang:zh_cn，其他行原样保留', async () => {
+  const env = makeEnv('opt-append');
+  const optFile = path.join(env.instanceDir, 'options.txt');
+  const original = 'version:1.0\nrenderDistance:8\nfov:0.5\nnarrator:1\n';
+  fs.writeFileSync(optFile, original, 'utf8');
+
+  const launcher = new GameLauncher({
+    versionRepo: new FakeVersionRepo({ '1.21.4': version121() }),
+    dataRoot: env.dataRoot,
+    platform: WINDOWS,
+  });
+  await launcher.buildCommand({ versionId: '1.21.4', instanceDir: env.instanceDir, account: OFFLINE });
+
+  const content = fs.readFileSync(optFile, 'utf8').replace(/\r\n/g, '\n');
+  assert.match(content, /^lang:zh_cn$/m, '应追加 lang:zh_cn');
+  // 原有每一行都必须原样在
+  for (const line of ['version:1.0', 'renderDistance:8', 'fov:0.5', 'narrator:1']) {
+    assert.ok(content.split('\n').includes(line), `原有行 ${line} 必须保留`);
+  }
+  assert.ok(!content.includes(': '), '不能引入冒号后空格');
+  // 只追加了一行
+  assert.equal(content.trimEnd().split('\n').length, 5, '应恰好 5 行');
+
+  fs.rmSync(env.dataRoot, { recursive: true, force: true });
+});
+
+test('options.txt：已有 lang:en_us → 逐字节不变（绝不改回中文）', async () => {
+  const env = makeEnv('opt-respect');
+  const optFile = path.join(env.instanceDir, 'options.txt');
+  const original = 'version:1.0\nlang:en_us\nrenderDistance:16\nguiScale:2\n';
+  fs.writeFileSync(optFile, original, 'utf8');
+  const before = fs.readFileSync(optFile);
+  const beforeMtime = fs.statSync(optFile).mtimeMs;
+
+  const launcher = new GameLauncher({
+    versionRepo: new FakeVersionRepo({ '1.21.4': version121() }),
+    dataRoot: env.dataRoot,
+    platform: WINDOWS,
+  });
+  await launcher.buildCommand({ versionId: '1.21.4', instanceDir: env.instanceDir, account: OFFLINE });
+
+  const after = fs.readFileSync(optFile);
+  assert.deepEqual(after, before, '文件内容必须逐字节不变');
+  assert.equal(fs.statSync(optFile).mtimeMs, beforeMtime, '连 mtime 都不该变（说明根本没写）');
+  assert.ok(!after.toString('utf8').includes('zh_cn'));
+
+  fs.rmSync(env.dataRoot, { recursive: true, force: true });
+});
+
+test('options.txt：已有 lang:ja_jp → 同样不动', async () => {
+  const env = makeEnv('opt-ja');
+  const optFile = path.join(env.instanceDir, 'options.txt');
+  const original = 'version:1.0\nlang:ja_jp\n';
+  fs.writeFileSync(optFile, original, 'utf8');
+  const before = fs.readFileSync(optFile);
+
+  const launcher = new GameLauncher({
+    versionRepo: new FakeVersionRepo({ '1.21.4': version121() }),
+    dataRoot: env.dataRoot,
+    platform: WINDOWS,
+  });
+  await launcher.buildCommand({ versionId: '1.21.4', instanceDir: env.instanceDir, account: OFFLINE });
+
+  assert.deepEqual(fs.readFileSync(optFile), before);
+  fs.rmSync(env.dataRoot, { recursive: true, force: true });
+});
+
+test('options.txt：重复启动不会重复追加 lang 行', async () => {
+  const env = makeEnv('opt-idempotent');
+  const launcher = new GameLauncher({
+    versionRepo: new FakeVersionRepo({ '1.21.4': version121() }),
+    dataRoot: env.dataRoot,
+    platform: WINDOWS,
+  });
+  await launcher.buildCommand({ versionId: '1.21.4', instanceDir: env.instanceDir, account: OFFLINE });
+  const optFile = path.join(env.instanceDir, 'options.txt');
+  const first = fs.readFileSync(optFile, 'utf8');
+
+  await launcher.buildCommand({ versionId: '1.21.4', instanceDir: env.instanceDir, account: OFFLINE });
+  const second = fs.readFileSync(optFile, 'utf8');
+
+  assert.equal(second, first, '第二次启动不该改动文件');
+  assert.equal(second.split('\n').filter((l) => l.startsWith('lang:')).length, 1, 'lang 行只能有一条');
+
+  fs.rmSync(env.dataRoot, { recursive: true, force: true });
+});
+
+test('P0-locale：默认 jvm 参数里有 -Duser.language=zh 与 -Duser.country=CN，且在 -cp 之前', async () => {
+  const env = makeEnv('locale-default');
+  const launcher = new GameLauncher({
+    versionRepo: new FakeVersionRepo({ '1.21.4': version121() }),
+    dataRoot: env.dataRoot,
+    platform: WINDOWS,
+  });
+  const cmd = await launcher.buildCommand({ versionId: '1.21.4', instanceDir: env.instanceDir, account: OFFLINE });
+
+  assert.ok(cmd.args.includes('-Duser.language=zh'), '应有 -Duser.language=zh');
+  assert.ok(cmd.args.includes('-Duser.country=CN'), '应有 -Duser.country=CN');
+
+  const cpAt = cmd.args.indexOf('-cp');
+  assert.ok(cpAt >= 0, '应有 -cp');
+  assert.ok(cmd.args.indexOf('-Duser.language=zh') < cpAt, 'locale 必须在 -cp 之前');
+  assert.ok(cmd.args.indexOf('-Duser.country=CN') < cpAt, 'locale 必须在 -cp 之前');
+  assert.equal(cmd.args[cpAt + 2], 'net.minecraft.client.main.Main', '-cp / value / mainClass 仍相邻');
+
+  fs.rmSync(env.dataRoot, { recursive: true, force: true });
+});
+
+test('P0-locale：用户显式传 -Duser.language=ja → 不重复添加 zh', async () => {
+  const env = makeEnv('locale-ja');
+  const launcher = new GameLauncher({
+    versionRepo: new FakeVersionRepo({ '1.21.4': version121() }),
+    dataRoot: env.dataRoot,
+    platform: WINDOWS,
+  });
+  const cmd = await launcher.buildCommand({
+    versionId: '1.21.4',
+    instanceDir: env.instanceDir,
+    account: OFFLINE,
+    extraJvmArgs: ['-Duser.language=ja'],
+  });
+
+  const langArgs = cmd.args.filter((a) => a.startsWith('-Duser.language'));
+  assert.deepEqual(langArgs, ['-Duser.language=ja'], `用户设置必须被尊重，实际：${JSON.stringify(langArgs)}`);
+  assert.ok(!cmd.args.includes('-Duser.language=zh'), '不能出现 zh');
+  // country 仍可补（用户没指定）
+  assert.ok(cmd.args.includes('-Duser.country=CN'), '未指定的 country 仍应补上');
+
+  const cpAt = cmd.args.indexOf('-cp');
+  assert.ok(cmd.args.indexOf('-Duser.country=CN') < cpAt);
+
+  fs.rmSync(env.dataRoot, { recursive: true, force: true });
+});
+
+test('P0-locale：用户同时传了 language 与 country → 一个都不补', async () => {
+  const env = makeEnv('locale-both');
+  const launcher = new GameLauncher({
+    versionRepo: new FakeVersionRepo({ '1.21.4': version121() }),
+    dataRoot: env.dataRoot,
+    platform: WINDOWS,
+  });
+  const cmd = await launcher.buildCommand({
+    versionId: '1.21.4',
+    instanceDir: env.instanceDir,
+    account: OFFLINE,
+    extraJvmArgs: ['-Duser.language=en', '-Duser.country=US'],
+  });
+
+  assert.equal(cmd.args.filter((a) => a.startsWith('-Duser.language')).length, 1);
+  assert.equal(cmd.args.filter((a) => a.startsWith('-Duser.country')).length, 1);
+  assert.ok(cmd.args.includes('-Duser.language=en'));
+  assert.ok(cmd.args.includes('-Duser.country=US'));
+  assert.ok(!cmd.args.some((a) => a.includes('zh') && a.startsWith('-Duser')));
+
+  fs.rmSync(env.dataRoot, { recursive: true, force: true });
+});
+
+test('options.txt：老版本（无 arguments.jvm）也会生成，且 locale 参数同样在 -cp 前', async () => {
+  const env = makeEnv('locale-legacy');
+  const legacy = {
+    id: '1.8.9',
+    type: 'release',
+    mainClass: 'net.minecraft.client.main.Main',
+    assets: '1.8',
+    libraries: [lib('com.google.guava:guava:17.0', 'com/google/guava/guava/17.0/guava-17.0.jar')],
+    minecraftArguments: '--username ${auth_player_name} --version ${version_name}',
+    javaVersion: { component: 'jre-legacy', majorVersion: 8 },
+  } as unknown as VersionJson;
+  // 老版本用 java 8：塞一个 8 的 java home
+  const javaHome8 = path.join(env.dataRoot, 'java', 'jre-legacy', '8');
+  fs.mkdirSync(path.join(javaHome8, 'bin'), { recursive: true });
+  fs.writeFileSync(path.join(javaHome8, 'bin', 'javaw.exe'), 'fake');
+  fs.writeFileSync(path.join(javaHome8, 'release'), 'JAVA_VERSION="1.8.0_202"\n');
+
+  const launcher = new GameLauncher({
+    versionRepo: new FakeVersionRepo({ '1.8.9': legacy }),
+    dataRoot: env.dataRoot,
+    platform: WINDOWS,
+  });
+  const cmd = await launcher.buildCommand({ versionId: '1.8.9', instanceDir: env.instanceDir, account: OFFLINE });
+
+  const optFile = path.join(env.instanceDir, 'options.txt');
+  assert.ok(fs.existsSync(optFile), '老版本也要生成 options.txt');
+  assert.match(fs.readFileSync(optFile, 'utf8'), /lang:zh_cn/);
+  assert.ok(cmd.args.includes('-Duser.language=zh'));
+  const cpAt = cmd.args.indexOf('-cp');
+  assert.ok(cmd.args.indexOf('-Duser.language=zh') < cpAt, 'locale 必须在 -cp 之前（老版本路径也一样）');
+
+  fs.rmSync(env.dataRoot, { recursive: true, force: true });
+});
+
+test('options-txt：hasSystemProperty / withDefaultLocale 纯函数的边界', async () => {
+  const { hasSystemProperty, withDefaultLocale } = await import('../src/core/launch/command.js');
+
+  assert.equal(hasSystemProperty(['-Duser.language=zh'], 'user.language'), true);
+  assert.equal(hasSystemProperty(['-Duser.language', 'zh'], 'user.language'), true);
+  assert.equal(hasSystemProperty(['-Duser.language'], 'user.language'), false, '没有值不算声明');
+  assert.equal(hasSystemProperty(['-Duser.language=zh'], 'user.country'), false, '键名不能前缀误判');
+
+  assert.deepEqual(withDefaultLocale([]), ['-Duser.language=zh', '-Duser.country=CN']);
+  assert.deepEqual(withDefaultLocale(['-Duser.language=ja']), ['-Duser.language=ja', '-Duser.country=CN']);
+  assert.deepEqual(
+    withDefaultLocale(['-Duser.language=en', '-Duser.country=US']),
+    ['-Duser.language=en', '-Duser.country=US'],
+  );
+  // 不修改入参
+  const input = ['-Xmx1G'];
+  withDefaultLocale(input);
+  assert.deepEqual(input, ['-Xmx1G']);
+});
+
+test('options-txt：ensureChineseOptions 的三种 action 与原子写', async () => {
+  const { ensureChineseOptions, DEFAULT_OPTIONS_LINES } = await import('../src/core/launch/options-txt.js');
+  const dir = tmpDir('opt-unit');
+
+  const created = await ensureChineseOptions(dir);
+  assert.equal(created.action, 'created');
+  assert.ok(created.content.includes('lang:zh_cn'));
+  assert.deepEqual(created.content.split('\n'), [...DEFAULT_OPTIONS_LINES]);
+
+  // 残留临时文件检查（原子写应清理干净）
+  const leftovers = fs.readdirSync(dir).filter((f) => f.includes('.tmp'));
+  assert.deepEqual(leftovers, [], '不应残留临时文件');
+
+  const unchanged = await ensureChineseOptions(dir);
+  assert.equal(unchanged.action, 'unchanged');
+
+  // 删掉 lang 行后再跑 → appended-lang
+  fs.writeFileSync(path.join(dir, 'options.txt'), 'version:1.0\nfov:0.5\n', 'utf8');
+  const appended = await ensureChineseOptions(dir);
+  assert.equal(appended.action, 'appended-lang');
+  assert.ok(appended.content.endsWith('lang:zh_cn'), `实际：${appended.content}`);
+  assert.ok(appended.content.startsWith('version:1.0\nfov:0.5\n'), '原有内容必须在前面');
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// ═══════════════ 测试：options.txt 备份保护（用户资产，写坏即灾难） ═══════════════
+
+test('备份：需要追加 lang 时生成 .bak-* 且内容与原文件逐字节相同', async () => {
+  const { ensureChineseOptions, BACKUP_PREFIX } = await import('../src/core/launch/options-txt.js');
+  const dir = tmpDir('bak-create');
+  const optFile = path.join(dir, 'options.txt');
+  // 模拟用户的完整配置（真实规模，5356 字节那种）
+  const userConfig = [
+    'version:5023',
+    'ao:true',
+    'biomeBlendRadius:2',
+    'renderDistance:16',
+    'guiScale:2',
+    'fov:0.5',
+    'soundCategory_master:0.73',
+    'key_key.forward:87',
+    'key_key.jump:32',
+  ].join('\n') + '\n';
+  fs.writeFileSync(optFile, userConfig, 'utf8');
+  const before = fs.readFileSync(optFile);
+
+  const result = await ensureChineseOptions(dir);
+  assert.equal(result.action, 'appended-lang');
+  assert.ok(result.backup, '必须给出备份路径');
+  assert.ok(fs.existsSync(result.backup), '备份文件必须真实存在');
+  assert.ok(path.basename(result.backup).startsWith(BACKUP_PREFIX), `备份名应带前缀，实际 ${path.basename(result.backup)}`);
+
+  // 备份内容与原文件**逐字节相同**
+  const backupBytes = fs.readFileSync(result.backup);
+  assert.deepEqual(backupBytes, before, '备份必须与原文件逐字节相同');
+
+  // 主文件已被追加，但原有每一行都还在
+  const after = fs.readFileSync(optFile, 'utf8');
+  for (const line of userConfig.trimEnd().split('\n')) {
+    assert.ok(after.split('\n').includes(line), `原有行 ${line} 必须保留`);
+  }
+  assert.match(after, /^lang:zh_cn$/m, '追加后应含 lang:zh_cn');
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('备份：只保留最近 3 份，旧的自动清理', async () => {
+  const { ensureChineseOptions, listBackups, MAX_BACKUPS } = await import('../src/core/launch/options-txt.js');
+  const dir = tmpDir('bak-prune');
+  const optFile = path.join(dir, 'options.txt');
+
+  // 连续 5 次「删掉 lang 行 → 触发追加」，每次都会产生一份备份
+  const seen: string[] = [];
+  for (let i = 0; i < 5; i += 1) {
+    fs.writeFileSync(optFile, `version:1.0\nmarker:${String(i)}\n`, 'utf8');
+    // 给不同的时间戳，保证文件名可区分（真实场景是不同启动时间）
+    const result = await ensureChineseOptions(dir, Date.now() + i * 1000);
+    assert.equal(result.action, 'appended-lang');
+    if (result.backup) seen.push(result.backup);
+  }
+
+  const remaining = await listBackups(dir);
+  assert.equal(remaining.length, MAX_BACKUPS, `应只剩 ${String(MAX_BACKUPS)} 份，实际 ${String(remaining.length)}`);
+
+  // 留下的必须是最新的 3 份（文件名倒序前 3 个）
+  const expected = seen.slice(-MAX_BACKUPS).map((p) => path.basename(p)).sort().reverse();
+  assert.deepEqual(remaining.map((p) => path.basename(p)), expected, '应保留最新的 3 份，删掉更早的');
+
+  // 被清掉的那份确实不在盘上了
+  for (const old of seen.slice(0, 2)) {
+    assert.ok(!fs.existsSync(old), `旧备份 ${path.basename(old)} 应已被清理`);
+  }
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('备份：已有 lang: 时不写也不产生备份', async () => {
+  const { ensureChineseOptions, listBackups } = await import('../src/core/launch/options-txt.js');
+  const dir = tmpDir('bak-none');
+  const optFile = path.join(dir, 'options.txt');
+  fs.writeFileSync(optFile, 'version:1.0\nlang:en_us\nfov:0.5\n', 'utf8');
+  const before = fs.readFileSync(optFile);
+  const beforeMtime = fs.statSync(optFile).mtimeMs;
+
+  const result = await ensureChineseOptions(dir);
+  assert.equal(result.action, 'unchanged');
+  assert.equal(result.backup, undefined, '没写就不该有备份');
+  assert.deepEqual(await listBackups(dir), [], '目录里不该出现任何 .bak-*');
+
+  // 主文件一字未动
+  assert.deepEqual(fs.readFileSync(optFile), before);
+  assert.equal(fs.statSync(optFile).mtimeMs, beforeMtime);
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('备份：文件不存在（首次创建）时不产生备份', async () => {
+  const { ensureChineseOptions, listBackups } = await import('../src/core/launch/options-txt.js');
+  const dir = tmpDir('bak-created');
+
+  const result = await ensureChineseOptions(dir);
+  assert.equal(result.action, 'created');
+  assert.equal(result.backup, undefined, '新建文件没有「原文件」可备份');
+  assert.deepEqual(await listBackups(dir), []);
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('备份失败 → 放弃写入，action 为 skipped-backup-failed，原文件内容不变', async () => {
+  const { ensureChineseOptions } = await import('../src/core/launch/options-txt.js');
+  const dir = tmpDir('bak-fail');
+  const optFile = path.join(dir, 'options.txt');
+  const original = 'version:1.0\nfov:0.5\n';
+  fs.writeFileSync(optFile, original, 'utf8');
+  const before = fs.readFileSync(optFile);
+
+  // 造一个必然失败的备份：在目录里预先铺满 100 个同名候选备份（mkdtemp 产物），
+  // 让 backupOptions 的 COPYFILE_EXCL 每次都命中 EEXIST，最终抛出「连续撞名」。
+  // 这比 chmod 可靠（Windows 上只读目录不阻止新建文件）。
+  const { BACKUP_PREFIX } = await import('../src/core/launch/options-txt.js');
+  const now = 1_700_000_000_000;
+  const stamp = new Date(now).toISOString().replace(/[:.]/g, '-');
+  for (let seq = 0; seq < 100; seq += 1) {
+    const name = seq === 0 ? `${BACKUP_PREFIX}${stamp}` : `${BACKUP_PREFIX}${stamp}-${String(seq)}`;
+    fs.mkdirSync(path.join(dir, name), { recursive: true }); // 空目录占位 → copyFile 会 EEXIST/EPERM
+  }
+
+  const result = await ensureChineseOptions(dir, now);
+  assert.equal(result.action, 'skipped-backup-failed', '备份失败必须放弃写入');
+  assert.match(result.skippedReason ?? '', /备份失败/);
+  assert.equal(result.backup, undefined, '失败时不该报告备份路径');
+
+  // 核心不变量：**没备份就绝不写**——原文件必须逐字节不变
+  assert.deepEqual(fs.readFileSync(optFile), before, '放弃写入时原文件必须完全没变');
+  assert.ok(!fs.readFileSync(optFile, 'utf8').includes('lang:'), '不该出现任何 lang 行');
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('备份：copyFile 在源文件不可读时抛错（backupOptions 直接失败）', async () => {
+  const mod = await import('../src/core/launch/options-txt.js');
+  const dir = tmpDir('bak-nosrc');
+  // 源 options.txt 根本不存在 → copyFile 抛 ENOENT
+  await assert.rejects(() => mod.backupOptions(dir), /ENOENT|no such file/i);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// ═══════════════ 测试：多实例隔离（绝不串味） ═══════════════
+
+test('多实例隔离：两个 instanceDir 的 options.txt 互不影响', async () => {
+  const { ensureChineseOptions } = await import('../src/core/launch/options-txt.js');
+  // 用 makeEnv 建一个带假 java 的数据目录（buildCommand 会走 pickJava）
+  const env = makeEnv('iso-two');
+  const dirA = path.join(env.dataRoot, 'instances', 'A');
+  const dirB = path.join(env.dataRoot, 'instances', 'B');
+  fs.mkdirSync(dirA, { recursive: true });
+  fs.mkdirSync(dirB, { recursive: true });
+
+  // 模拟真实情况：A 是用户真玩的完整配置，B 完全没有 options.txt
+  const configA = 'version:5023\nrenderDistance:16\nguiScale:2\n';
+  fs.writeFileSync(path.join(dirA, 'options.txt'), configA, 'utf8');
+
+  const launcher = new GameLauncher({
+    versionRepo: new FakeVersionRepo({ '1.21.4': version121() }),
+    dataRoot: env.dataRoot,
+    platform: WINDOWS,
+  });
+
+  const aBefore = fs.readFileSync(path.join(dirA, 'options.txt'));
+
+  // 先跑 B（生成全新配置），再跑 A（追加 lang）
+  await launcher.buildCommand({ versionId: '1.21.4', instanceDir: dirB, account: OFFLINE });
+  await launcher.buildCommand({ versionId: '1.21.4', instanceDir: dirA, account: OFFLINE });
+
+  // A：原配置保留 + 追加 lang
+  const aAfter = fs.readFileSync(path.join(dirA, 'options.txt'), 'utf8');
+  assert.ok(aAfter.startsWith(configA.trimEnd()), 'A 的原有配置必须完整保留');
+  assert.match(aAfter, /^lang:zh_cn$/m);
+  // B 的生成行为不能污染 A：A 的第一行仍是 version:5023，而不是 version:1.0
+  assert.ok(aAfter.startsWith('version:5023'), 'A 的 version 不能被 B 的默认值覆盖');
+
+  // B：独立的最小配置
+  const bAfter = fs.readFileSync(path.join(dirB, 'options.txt'), 'utf8');
+  assert.ok(bAfter.startsWith('version:1.0'), 'B 应是独立生成的最小配置');
+  assert.ok(!bAfter.includes('renderDistance:16'), 'B 不能沾到 A 的配置');
+  assert.ok(!bAfter.includes('version:5023'), 'B 不能沾到 A 的 version');
+
+  // 备份只在 A 目录
+  const aFiles = fs.readdirSync(dirA).filter((f) => f.startsWith('options.txt.bak-'));
+  const bFiles = fs.readdirSync(dirB).filter((f) => f.startsWith('options.txt.bak-'));
+  assert.equal(aFiles.length, 1, 'A 应有 1 份备份');
+  assert.equal(bFiles.length, 0, 'B 是新建文件，不该有备份');
+  // 备份内容等于 A 的原始内容
+  assert.deepEqual(fs.readFileSync(path.join(dirA, aFiles[0] as string)), aBefore);
+
+  // 再跑一次 B（已有 lang）→ 依然什么都不做
+  await launcher.buildCommand({ versionId: '1.21.4', instanceDir: dirB, account: OFFLINE });
+  assert.equal(fs.readFileSync(path.join(dirB, 'options.txt'), 'utf8'), bAfter, 'B 第二次启动不该变');
+
+  fs.rmSync(env.dataRoot, { recursive: true, force: true });
+});
+
+test('多实例隔离：instanceDir 不同 → 所有产物都落在各自目录，无全局路径', async () => {
+  const { ensureChineseOptions, listBackups } = await import('../src/core/launch/options-txt.js');
+  const dirs = [tmpDir('iso-1'), tmpDir('iso-2'), tmpDir('iso-3')];
+  for (const dir of dirs) {
+    fs.writeFileSync(path.join(dir, 'options.txt'), `version:1.0\nid:${path.basename(dir)}\n`, 'utf8');
+  }
+
+  for (const dir of dirs) {
+    const r = await ensureChineseOptions(dir);
+    assert.equal(r.action, 'appended-lang');
+    // 文件与备份都在自己的目录里
+    assert.equal(path.dirname(r.file), dir);
+    assert.equal(path.dirname(r.backup as string), dir);
+  }
+
+  for (const dir of dirs) {
+    const files = fs.readdirSync(dir).filter((f) => f.startsWith('options.txt.bak-'));
+    assert.equal(files.length, 1, `${path.basename(dir)} 应恰有 1 份自己的备份`);
+    // 内容里带着自己的 id，证明没有串到别的实例
+    const content = fs.readFileSync(path.join(dir, 'options.txt'), 'utf8');
+    assert.ok(content.includes(`id:${path.basename(dir)}`), '内容必须是自己的');
+    assert.equal((await listBackups(dir)).length, 1);
+  }
+
+  for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true });
 });

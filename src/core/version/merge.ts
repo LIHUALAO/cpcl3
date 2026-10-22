@@ -24,16 +24,28 @@ interface ArgList {
 }
 
 /**
- * Maven 坐标的「同名」判定 key。
- * `group:artifact:version[:classifier]` → `group:artifact`，
- * 这样子版本带 `@jar`/`natives` 更新版本时仍然能覆盖父版本的同名 artifact。
+ * Maven 坐标的「同名」判定 key：`group:artifact[:classifier]`。
+ *
+ * ⚠ classifier 必须参与比较。老实现只取 `group:artifact`，于是原版里成对出现的
+ *
+ *   com.mojang:jtracy:1.14.38                  ← 主 jar，游戏代码真正要加载的
+ *   com.mojang:jtracy:1.14.38:natives-windows  ← 原生库（带 rules）
+ *
+ * 被判成同一个库，后者覆盖前者，合并结果只剩 natives → classpath 缺 jtracy 主 jar →
+ * 游戏在 `<clinit>` 阶段 `NoClassDefFoundError: com/mojang/jtracy/TracyClient` 崩溃。
+ *
+ * 同 group:artifact 且**同 classifier** 才由子覆盖父（正常版本升级）；
+ * classifier 不同的视为两个独立库，同时保留。
  */
 export function libraryKey(name: string): string {
   const raw = name.trim();
   // 去掉尾部 @ext
   const withoutExt = raw.includes('@') ? raw.slice(0, raw.lastIndexOf('@')) : raw;
   const parts = withoutExt.split(':');
-  if (parts.length >= 2) return `${parts[0]}:${parts[1]}`;
+  if (parts.length >= 2) {
+    const classifier = parts.length >= 4 ? (parts[3] ?? '') : '';
+    return classifier === '' ? `${parts[0]}:${parts[1]}` : `${parts[0]}:${parts[1]}:${classifier}`;
+  }
   return withoutExt;
 }
 

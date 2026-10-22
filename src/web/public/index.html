@@ -1,0 +1,1156 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PCL3 — Minecraft 启动器</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="stylesheet" href="/themes.css">
+<script>
+/* 首屏防闪：主题必须在 CSS 生效前就挂到 <html> 上。
+   等 theme.js（放在 body 末尾）跑完再设置的话，用户会先看到一下默认深色再跳到浅色。
+   这里只做「读 → 挂属性」，不处理任何交互；真正的逻辑与持久化全在 theme.js。
+   任何一步失败（隐私模式禁 localStorage / 老浏览器）都静默降级成默认深色。 */
+(function () {
+  try {
+    var root = document.documentElement;
+    var get = function (key) {
+      try { return window.localStorage.getItem(key) || ''; } catch (e) { return ''; }
+    };
+    var KNOWN = ['pcl3-dark', 'graphite', 'ocean', 'forest', 'sunset', 'light'];
+    var prefLight = false;
+    try { prefLight = !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches); } catch (e) {}
+
+    var follow = get('pcl3.theme.followSystem') === '1';
+    var stored = get('pcl3.theme');
+    var theme = KNOWN.indexOf(stored) !== -1 ? stored : (prefLight ? 'light' : 'pcl3-dark');
+    if (follow) theme = prefLight ? 'light' : 'pcl3-dark';
+    root.setAttribute('data-theme', theme);
+
+    var accent = get('pcl3.accent');
+    if (['teal', 'blue', 'purple', 'orange', 'pink', 'red'].indexOf(accent) !== -1) root.setAttribute('data-accent', accent);
+
+    var font = get('pcl3.fontSize');
+    if (font === 'sm' || font === 'lg') root.setAttribute('data-font-size', font);
+
+    if (get('pcl3.density') === 'compact') root.setAttribute('data-density', 'compact');
+    if (get('pcl3.motion') === 'off') root.setAttribute('data-motion', 'off');
+  } catch (e) { /* 首屏拿不到存储就用默认皮肤，不影响页面 */ }
+})();
+</script>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo" aria-hidden="true">PCL</span>
+    <span class="title">PCL3 <span class="sub">Minecraft 启动器</span></span>
+  </div>
+  <div class="statusbar" id="statusbar">
+    <span class="chip" id="chip-data-root" title="数据目录">
+      <span class="dot dot-idle"></span><span class="chip-label">数据目录</span>
+      <span class="chip-value" id="data-root">读取中…</span>
+    </span>
+    <span class="chip" id="chip-java" title="Java 运行时">
+      <span class="dot dot-idle"></span><span class="chip-label">Java</span>
+      <span class="chip-value" id="java-value">检测中…</span>
+    </span>
+    <span class="chip" title="已安装版本数">
+      <span class="chip-label">已装</span>
+      <span class="chip-value" id="installed-count">–</span>
+    </span>
+    <button class="btn btn-ghost btn-sm btn-theme-toggle" id="btn-theme-toggle" type="button"
+            title="切换深色 / 浅色" aria-label="切换深色 / 浅色">☀</button>
+    <button class="btn btn-ghost btn-sm" id="btn-refresh" type="button">刷新</button>
+  </div>
+</header>
+
+<main class="layout">
+
+  <!--
+    ┌──────────┬────────────────────────────────┬──────────┐
+    │ PCL3     │  内容区（一次只显示一个页面）  │ 右侧栏   │
+    │ 导航     │                                │ 账户/任务│
+    └──────────┴────────────────────────────────┴──────────┘
+
+    三层结构（导航 196px / 内容 1fr / 右栏 360px）：
+      1. <nav class="nav">       左侧导航，固定宽度
+      2. <div class="content">   中间内容区，每个页面一个 [data-page] 区块
+      3. <aside class="panel panel-side">  右侧常驻栏（账户 / 任务 / 日志）
+
+    页面切换完全由 nav.js 用 [hidden] + .is-active 完成，不走路由、不重新渲染。
+    **所有业务元素的 id / class 一个都没改**，只是换了容器层级：
+      home      ← 版本选择器（当前版本卡片 + 启动大按钮 + 添加内容）
+      download  ← 可下载版本列表（从主页搬过来，app.js 仍在渲染，只是换了容器 id）
+      versions  ← 已安装版本列表（原「实例」页，实例概念已取消）
+      content   ← #content-panel（Mod）+ #packs-panel（资源包/数据包/光影）
+      modpack   ← #modpack-panel
+      settings  ← 设置页；弹窗版 #config-modal 原样保留（infra.js 仍会打开它）
+
+    「实例」这个词已经从 UI 里彻底消失（用户原话：「实例选项应该改个名字比如版本选择什么的」）。
+  -->
+
+  <nav class="nav" id="main-nav" aria-label="主导航">
+    <div class="nav-head">
+      <span class="nav-dot" aria-hidden="true"></span>
+      <span class="muted">导航</span>
+    </div>
+
+    <ul class="nav-list" id="nav-list">
+      <li>
+        <button class="nav-item is-active" type="button" data-nav="home" aria-current="page">
+          <span class="nav-icon" aria-hidden="true">▣</span>
+          <span class="nav-text">主页</span>
+        </button>
+      </li>
+      <li>
+        <button class="nav-item" type="button" data-nav="download">
+          <span class="nav-icon" aria-hidden="true">⤓</span>
+          <span class="nav-text">下载</span>
+        </button>
+      </li>
+      <li>
+        <button class="nav-item" type="button" data-nav="versions">
+          <span class="nav-icon" aria-hidden="true">❐</span>
+          <span class="nav-text">版本</span>
+        </button>
+      </li>
+      <li>
+        <button class="nav-item" type="button" data-nav="content">
+          <span class="nav-icon" aria-hidden="true">❖</span>
+          <span class="nav-text">内容</span>
+        </button>
+      </li>
+      <li>
+        <button class="nav-item" type="button" data-nav="modpack">
+          <span class="nav-icon" aria-hidden="true">▤</span>
+          <span class="nav-text">整合包</span>
+        </button>
+      </li>
+      <li>
+        <button class="nav-item" type="button" data-nav="settings">
+          <span class="nav-icon" aria-hidden="true">⚙</span>
+          <span class="nav-text">设置</span>
+        </button>
+      </li>
+    </ul>
+
+    <div class="nav-foot">
+      <span class="muted" id="nav-version">PCL3</span>
+    </div>
+  </nav>
+
+  <div class="content">
+
+    <!-- ═══════════════ 主页：版本选择器 + 启动 + 添加内容 ═══════════════
+         用户原话：「主页所有版本都在这里不太好选，应该也改成一个版本选择按钮，
+                   选择的时候再列出所有下载的版本」「主页能装 mod 加载器却不能给这个版本添加其他 mod」。
+         所以这里只显示**当前选中的那一个版本**，200 个可下载版本搬去「下载」页。
+         卡片内容全部由 versions.js 渲染（它同时管「版本页」和「下载页」）。 -->
+    <section class="page" data-page="home" aria-label="主页">
+      <div class="page-head">
+        <h2>主页 <span class="sub-tag">当前版本</span></h2>
+        <div class="filters">
+          <button class="btn btn-ghost btn-sm" type="button" data-goto="download">去下载新版本</button>
+        </div>
+      </div>
+
+      <div class="page-body">
+        <section class="panel panel-main home-current" id="home-current-panel">
+          <div class="panel-body">
+            <!-- versions.js 往这里画「26.3 [正式版] Fabric 0.19.5 / 上次启动：…」 -->
+            <div class="home-current-card" id="home-current-card">
+              <p class="empty" id="home-current-empty">正在读取已安装版本…</p>
+            </div>
+
+            <div class="home-current-actions">
+              <button class="btn btn-ghost" id="btn-home-switch" type="button">切换版本 ▾</button>
+              <button class="btn btn-ghost" id="btn-home-rename" type="button">⚙ 重命名</button>
+              <button class="btn btn-ghost" id="btn-home-folders" type="button">打开文件夹</button>
+              <button class="btn btn-ghost" id="btn-home-settings" type="button">设置</button>
+            </div>
+
+            <button class="btn btn-play btn-launch-big" id="btn-home-launch" type="button">启 动</button>
+
+            <div class="home-current-extra">
+              <button class="btn btn-primary" id="btn-home-content" type="button">添加额外内容</button>
+              <span class="hint" id="home-launch-hint">内容页会带着这个版本走，不会装错地方。</span>
+            </div>
+
+            <p class="modal-error error-text" id="home-error" hidden></p>
+          </div>
+        </section>
+      </div>
+    </section>
+
+    <!-- ═══════════════ 下载：所有可下载版本（从主页搬过来） ═══════════════
+         用户原话：「下载界面可以自选下载版本」→ 独立成页。
+         搜索框与类型筛选原样保留，id 也没变（app.js 仍在读写它们）。 -->
+    <section class="page" data-page="download" aria-label="下载">
+      <div class="page-head">
+        <h2>下载 <span class="sub-tag">Mojang 官方清单</span></h2>
+        <div class="filters">
+          <input type="search" id="search" class="input" placeholder="搜索版本号，例如 1.21" autocomplete="off">
+          <select id="filter-type" class="input select">
+            <option value="release">正式版</option>
+            <option value="snapshot">快照</option>
+            <option value="old_beta">旧 Beta</option>
+            <option value="old_alpha">旧 Alpha</option>
+            <option value="all">全部类型</option>
+          </select>
+          <button class="btn btn-ghost btn-sm" id="btn-versions-refresh" type="button" title="重新拉取官方清单">刷新清单</button>
+        </div>
+      </div>
+
+      <div class="page-body">
+        <!-- 版本列表容器：app.js 按 id 找它并渲染 .version-grid，id 保持不变 -->
+        <div class="panel-body" id="version-list">
+          <p class="empty" id="versions-empty">正在加载版本列表…</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════════ 版本：所有「已安装」版本（原「实例」页） ═══════════════
+         用户原话：「实例选项应该改个名字比如版本选择什么的」+「版本旁边应该也可以加一个小按钮能重命名」。
+         这一页只列已安装的版本：点一下切换成当前版本，旁边的小按钮重命名 / 删除。 -->
+    <section class="page" data-page="versions" aria-label="版本">
+      <div class="page-head">
+        <h2>版本 <span class="sub-tag">已安装</span></h2>
+        <div class="filters">
+          <input type="search" id="version-manage-search" class="input" placeholder="搜索已安装版本" autocomplete="off">
+          <button class="btn btn-ghost btn-sm" id="btn-version-manage-refresh" type="button">刷新</button>
+        </div>
+      </div>
+
+      <div class="page-body">
+        <section class="panel panel-main" id="version-manage-panel">
+          <div class="panel-body">
+            <ul class="installed-list" id="installed-list"></ul>
+            <p class="empty" id="installed-empty">正在读取已安装版本…</p>
+          </div>
+        </section>
+      </div>
+    </section>
+
+    <!-- ═══════════════ 内容：Mod / 资源包 / 数据包 / 光影（二级标签） ═══════════════
+         用户点名要的「整合」：把原本两个独立面板（Modrinth 内容源 + 本地资源包管理）
+         收进同一个页面的二级标签。两块面板各自完整保留，只是谁被显示的问题。
+
+         ★ 顶部那条 target-banner 是用户第一条反馈的直接产物：
+           「mod 下载列表这边我不知道下载给哪个版本了，选择太不明显了」
+           所以这里不是一个小下拉框，而是一整条会发光的横幅：「正在给 26.3 添加内容」。 -->
+    <section class="page" data-page="content" aria-label="内容">
+
+      <!-- 目标版本横幅：versions.js 负责填充文字，点「切换」弹出已安装版本列表 -->
+      <div class="target-banner" id="content-target" role="status" aria-live="polite">
+        <span class="target-banner-icon" aria-hidden="true">◎</span>
+        <div class="target-banner-main">
+          <div class="target-banner-text">正在给 <strong id="content-target-name">— 还没选版本 —</strong> 添加内容</div>
+          <div class="target-banner-sub" id="content-target-sub">
+            装好的文件会落在这个版本的目录里，不会影响其它版本。
+          </div>
+        </div>
+        <button class="btn btn-ghost" id="btn-content-target-switch" type="button">切换版本 ▾</button>
+      </div>
+
+      <div class="page-head page-head-stack">
+        <div class="page-head-row">
+          <h2>内容 <span class="sub-tag">Modrinth · 本地</span></h2>
+          <div class="filters">
+            <!-- 两套版本选择器都还在，各自待在自己所属的二级标签里：
+                 #content-instance 给 Modrinth / 已装模组用（Mod 标签的标题栏）；
+                 #packs-instance 给本地资源包/数据包/光影用（本地标签的标题栏）。
+                 mods.js / packs.js 都按 id 找它们，位置变了但 id 没动。
+                 它们现在与顶部横幅、与主页的「当前版本」保持同步（versions.js 统一管）。 -->
+          </div>
+        </div>
+
+        <!-- 二级标签：纯 CSS 切换（data-tab + [data-tab-panel]），点击时 nav.js 会
+             顺手点一下 #content-type / #packs-tabs 里对应的按钮，让两个既有脚本各自动起来 -->
+        <div class="seg page-tabs" id="content-tabs" role="tablist" aria-label="内容分类">
+          <button class="seg-btn is-active" type="button" data-tab="mod" role="tab" aria-selected="true">Mod</button>
+          <button class="seg-btn" type="button" data-tab="resourcepack" role="tab" aria-selected="false">资源包</button>
+          <button class="seg-btn" type="button" data-tab="datapack" role="tab" aria-selected="false">数据包</button>
+          <button class="seg-btn" type="button" data-tab="shader" role="tab" aria-selected="false">光影</button>
+        </div>
+      </div>
+
+      <div class="page-body">
+
+        <!-- ① Mod：Modrinth 搜索 + 已装模组（mods.js） -->
+        <div class="tab-panel is-active" data-tab-panel="mod">
+          <section class="panel panel-main" id="content-panel">
+            <div class="panel-head">
+              <h2>Mod <span class="sub-tag">Modrinth</span></h2>
+              <div class="filters">
+                <select class="input select" id="content-instance" title="装到哪个版本">
+                  <option value="">— 选择版本 —</option>
+                </select>
+                <button class="btn btn-ghost btn-sm" id="btn-content-refresh" type="button" title="重新读取已装模组">刷新</button>
+              </div>
+            </div>
+
+            <div class="panel-body">
+              <p class="hint" id="content-hint">
+                搜的是 <a href="https://modrinth.com" target="_blank" rel="noopener noreferrer">Modrinth</a> 的公开目录，
+                不用登录、不用 API key。装之前先在上面选一个<strong>带模组加载器</strong>的版本；
+                装完要重启游戏才生效。
+              </p>
+
+              <!-- ★ 醒目的「正在给谁装」：与顶部横幅同一个数据源（versions.js 写这里），
+                   放在搜索框正上方，用户还没往下滚就知道自己在给哪个版本装东西。 -->
+              <div class="target-inline" id="content-target-inline">
+                <span class="target-inline-label">装到</span>
+                <strong id="content-target-vid">—</strong>
+                <span class="target-inline-extra" id="content-target-inline-extra"></span>
+              </div>
+
+              <!-- 搜索条：关键词 + 类型 + 游戏版本 + 加载器 -->
+              <div class="content-search">
+                <input type="search" class="input" id="content-q" placeholder="搜索模组，例如 sodium / jei" autocomplete="off">
+                <button class="btn btn-primary" id="btn-content-search" type="button">搜索</button>
+              </div>
+
+              <div class="content-filters">
+                <!-- 「搜什么类型」现在由上面的大二级标签决定；这一组小标签原样保留
+                     （mods.js 按 data-project-type 找它，删了它会直接不工作），
+                     视觉上降权隐藏，始终跟随二级标签的当前选择。 -->
+                <div class="seg" id="content-type" role="tablist" aria-hidden="true">
+                  <button class="seg-btn is-active" type="button" data-project-type="mod" role="tab">模组</button>
+                  <button class="seg-btn" type="button" data-project-type="resourcepack" role="tab">资源包</button>
+                  <button class="seg-btn" type="button" data-project-type="shader" role="tab">光影</button>
+                  <button class="seg-btn" type="button" data-project-type="datapack" role="tab">数据包</button>
+                </div>
+                <div class="content-selects">
+                  <label class="content-select">
+                    <span>游戏版本</span>
+                    <select class="input select" id="content-game-version">
+                      <option value="">全部</option>
+                    </select>
+                  </label>
+                  <label class="content-select">
+                    <span>加载器</span>
+                    <select class="input select" id="content-loader">
+                      <option value="">全部</option>
+                      <option value="fabric">Fabric</option>
+                      <option value="quilt">Quilt</option>
+                      <option value="forge">Forge</option>
+                      <option value="neoforge">NeoForge</option>
+                    </select>
+                  </label>
+                </div>
+              </div>
+
+              <p class="modal-error error-text" id="content-error" hidden></p>
+
+              <!-- 搜索结果 -->
+              <div class="content-section">
+                <div class="content-section-head">
+                  <span class="content-section-title">搜索结果</span>
+                  <span class="muted" id="content-total">—</span>
+                </div>
+                <ul class="result-list" id="content-results"></ul>
+                <p class="empty" id="content-empty">输入关键词后点「搜索」。</p>
+                <div class="content-more" id="content-more-wrap" hidden>
+                  <button class="btn btn-ghost btn-sm" id="btn-content-more" type="button">加载更多</button>
+                </div>
+              </div>
+
+              <!-- 已装模组 -->
+              <div class="content-section">
+                <div class="content-section-head">
+                  <span class="content-section-title">已装模组</span>
+                  <span class="muted" id="mods-summary">—</span>
+                </div>
+                <!--
+                  前置模组提示。安装一个需要依赖的 mod（比如需要 Fabric API）时，
+                  这里会亮出来并给出「去安装」的入口 —— 不提示的话用户进游戏只会看到
+                  「缺少依赖」然后一脸问号。
+                -->
+                <p class="mods-deps" id="mods-deps" hidden></p>
+                <ul class="pack-list" id="mods-list"></ul>
+                <p class="empty" id="mods-empty">先在上面选一个版本，再看看它的 mods 目录里有什么。</p>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <!-- ② 本地文件：资源包 / 数据包 / 光影（packs.js）
+             `data-tab-panel` 一次写全三个取值：无论二级标签选的是资源包、数据包还是光影，
+             这块容器都显示；里面具体显示哪一类，交给 packs.js 自己的 #packs-tabs 决定。
+             这样既不用把 DOM 复制三份（id 唯一约束，也免得 packs.js 认不出来），
+             也不会出现「点了数据包是一片空白」的空页。 -->
+        <div class="tab-panel" data-tab-panel="resourcepack datapack shader" hidden>
+          <section class="panel panel-main" id="packs-panel">
+            <div class="panel-head">
+              <h2>本地文件</h2>
+              <div class="filters">
+                <select class="input select" id="packs-instance" title="给哪个版本装">
+                  <option value="">— 选择版本 —</option>
+                </select>
+                <button class="btn btn-primary btn-sm" id="btn-packs-import" type="button" title="从本机选一个 .zip 导入">
+                  导入本地文件
+                </button>
+                <button class="btn btn-ghost btn-sm" id="btn-packs-refresh" type="button" title="重新读取目录">刷新</button>
+              </div>
+            </div>
+
+            <div class="panel-body">
+              <p class="hint" id="packs-hint">
+                只管把文件放进正确目录并开关它：资源包进 <code>resourcepacks/</code>，
+                数据包进 <code>datapacks/</code>（或某个存档的 <code>datapacks/</code>），
+                光影包进 <code>shaderpacks/</code>（需要先装 Iris / OptiFine 才会生效）。
+              </p>
+
+              <!-- 三个标签：packs.js 按 id 与 data-pack-kind 绑事件，一个都没改。
+                   它们的显隐与上面的大二级标签同步（nav.js 代为点击）。 -->
+              <div class="seg packs-tabs" id="packs-tabs" role="tablist">
+                <button class="seg-btn is-active" type="button" data-pack-kind="resourcepack" role="tab">资源包</button>
+                <button class="seg-btn" type="button" data-pack-kind="datapack" role="tab">数据包</button>
+                <button class="seg-btn" type="button" data-pack-kind="shader" role="tab">光影</button>
+              </div>
+
+              <!-- 数据包专属：存档选择 -->
+              <div class="field packs-save-field" id="packs-save-field" hidden>
+                <span class="field-label">作用范围</span>
+                <div class="row">
+                  <select class="input select" id="packs-save">
+                    <option value="">全局（所有存档，1.20+）</option>
+                  </select>
+                  <button class="btn btn-ghost btn-sm" id="btn-packs-save-reload" type="button" title="重新读取存档列表">刷新存档</button>
+                </div>
+              </div>
+
+              <p class="modal-error error-text" id="packs-error" hidden></p>
+
+              <!-- 列表 -->
+              <ul class="pack-list" id="pack-list"></ul>
+              <p class="empty" id="packs-empty">先在上面选一个版本，再看看这一类里有什么。</p>
+            </div>
+          </section>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ═══════════════ 整合包：导入 .mrpack → 预览 → 安装 ═══════════════ -->
+    <section class="page" data-page="modpack" aria-label="整合包">
+      <section class="panel panel-main" id="modpack-panel">
+        <div class="panel-head">
+          <h2>整合包</h2>
+          <div class="filters">
+            <button class="btn btn-primary btn-sm" id="btn-modpack-import" type="button">导入整合包</button>
+            <button class="btn btn-ghost btn-sm" id="btn-modpack-refresh" type="button" title="刷新已装整合包">刷新</button>
+          </div>
+        </div>
+
+        <div class="panel-body">
+          <p class="hint" id="modpack-hint">
+            支持 Modrinth 整合包（<code>.mrpack</code>）。导入后会先解析清单给你看，确认无误再安装；
+            整合包装进一个独立的版本目录，不会动你已有的版本。
+          </p>
+
+          <!-- 解析结果卡片：上传成功后显示 -->
+          <div class="modpack-card" id="modpack-preview" hidden>
+            <div class="modpack-head">
+              <div>
+                <div class="modpack-name" id="modpack-name">—</div>
+                <div class="modpack-sub" id="modpack-sub">—</div>
+              </div>
+              <span class="badge" id="modpack-status">待确认</span>
+            </div>
+
+            <dl class="modpack-facts">
+              <div class="fact"><dt>游戏版本</dt><dd id="modpack-game">—</dd></div>
+              <div class="fact"><dt>加载器</dt><dd id="modpack-loader">—</dd></div>
+              <div class="fact"><dt>Mod 数量</dt><dd id="modpack-mods">—</dd></div>
+              <div class="fact"><dt>下载大小</dt><dd id="modpack-size">—</dd></div>
+              <div class="fact"><dt>覆盖文件</dt><dd id="modpack-overrides">—</dd></div>
+              <div class="fact"><dt>跳过的服务端文件</dt><dd id="modpack-skipped">—</dd></div>
+            </dl>
+
+            <p class="hint" id="modpack-note" hidden></p>
+
+            <div class="field modpack-name-field">
+              <span class="field-label">版本名（决定安装目录，重名会被拒绝）</span>
+              <input class="input input-full" id="modpack-instance" type="text" maxlength="64" autocomplete="off"
+                     placeholder="留空则用整合包名">
+            </div>
+
+            <p class="modal-error error-text" id="modpack-error" hidden></p>
+
+            <div class="modpack-actions">
+              <button class="btn btn-ghost" id="btn-modpack-discard" type="button">取消</button>
+              <button class="btn btn-primary" id="btn-modpack-install" type="button">确认安装</button>
+            </div>
+          </div>
+
+          <!-- 已装整合包列表 -->
+          <ul class="modpack-list" id="modpack-list"></ul>
+          <p class="empty" id="modpack-empty">还没有装过整合包。点右上角「导入整合包」开始。</p>
+        </div>
+      </section>
+    </section>
+
+    <!-- ═══════════════ 设置：数据目录 / 下载源 / 内存默认值 ═══════════════
+         原先散在右侧栏「下载源」块和 #config-modal（数据目录弹窗）里。
+         这里做「页内也放一份」：输入框与下拉的 id 统一加 `setting-` 前缀，
+         真正发给后端的仍是原来那套接口（/api/config、/api/config/validate-dir）。
+         弹窗版 #config-modal 一个 id 都没动，infra.js 打开它照样能工作。 -->
+    <section class="page" data-page="settings" aria-label="设置">
+      <div class="page-head">
+        <h2>设置</h2>
+        <div class="filters">
+          <span class="muted" id="setting-hint">这些设置对整个启动器生效</span>
+        </div>
+      </div>
+
+      <div class="page-body">
+        <!-- 外观：主题 / 强调色 / 字号 / 紧凑 / 动效。
+             全部由 theme.js 驱动（它只读这几个 data-* 与 input，不碰业务逻辑），
+             控件 id 统一用 `setting-` 前缀，不与 infra.js 的设置页元素撞车。 -->
+        <section class="panel panel-main panel-sub" id="setting-appearance">
+          <div class="panel-head">
+            <h2>外观</h2>
+            <div class="filters">
+              <span class="muted" id="setting-appearance-summary">默认深色 · 字号中</span>
+            </div>
+          </div>
+          <div class="panel-body">
+            <div class="field">
+              <span class="field-label">主题（点击即时生效，不用刷新）</span>
+              <div class="theme-grid" id="setting-theme-grid" role="radiogroup" aria-label="主题">
+                <button class="theme-card" type="button" data-theme-choice="pcl3-dark" role="radio" aria-checked="true">
+                  <span class="theme-preview" data-preview="pcl3-dark" aria-hidden="true">
+                    <span class="tp-bar"></span><span class="tp-line"></span><span class="tp-line short"></span>
+                  </span>
+                  <span class="theme-name">默认深色</span>
+                </button>
+                <button class="theme-card" type="button" data-theme-choice="graphite" role="radio" aria-checked="false">
+                  <span class="theme-preview" data-preview="graphite" aria-hidden="true">
+                    <span class="tp-bar"></span><span class="tp-line"></span><span class="tp-line short"></span>
+                  </span>
+                  <span class="theme-name">石墨</span>
+                </button>
+                <button class="theme-card" type="button" data-theme-choice="ocean" role="radio" aria-checked="false">
+                  <span class="theme-preview" data-preview="ocean" aria-hidden="true">
+                    <span class="tp-bar"></span><span class="tp-line"></span><span class="tp-line short"></span>
+                  </span>
+                  <span class="theme-name">深海</span>
+                </button>
+                <button class="theme-card" type="button" data-theme-choice="forest" role="radio" aria-checked="false">
+                  <span class="theme-preview" data-preview="forest" aria-hidden="true">
+                    <span class="tp-bar"></span><span class="tp-line"></span><span class="tp-line short"></span>
+                  </span>
+                  <span class="theme-name">森林</span>
+                </button>
+                <button class="theme-card" type="button" data-theme-choice="sunset" role="radio" aria-checked="false">
+                  <span class="theme-preview" data-preview="sunset" aria-hidden="true">
+                    <span class="tp-bar"></span><span class="tp-line"></span><span class="tp-line short"></span>
+                  </span>
+                  <span class="theme-name">黄昏</span>
+                </button>
+                <button class="theme-card" type="button" data-theme-choice="light" role="radio" aria-checked="false">
+                  <span class="theme-preview" data-preview="light" aria-hidden="true">
+                    <span class="tp-bar"></span><span class="tp-line"></span><span class="tp-line short"></span>
+                  </span>
+                  <span class="theme-name">浅色</span>
+                </button>
+              </div>
+            </div>
+
+            <div class="field">
+              <span class="field-label">强调色（按钮、选中态、进度条）</span>
+              <div class="accent-row" id="setting-accent-row" role="radiogroup" aria-label="强调色">
+                <button class="accent-swatch" type="button" data-accent-choice="teal" role="radio"
+                        title="青绿（跟主题走）" aria-label="青绿" aria-checked="true"></button>
+                <button class="accent-swatch" type="button" data-accent-choice="blue" role="radio"
+                        title="蓝" aria-label="蓝" aria-checked="false"></button>
+                <button class="accent-swatch" type="button" data-accent-choice="purple" role="radio"
+                        title="紫" aria-label="紫" aria-checked="false"></button>
+                <button class="accent-swatch" type="button" data-accent-choice="orange" role="radio"
+                        title="橙" aria-label="橙" aria-checked="false"></button>
+                <button class="accent-swatch" type="button" data-accent-choice="pink" role="radio"
+                        title="粉" aria-label="粉" aria-checked="false"></button>
+                <button class="accent-swatch" type="button" data-accent-choice="red" role="radio"
+                        title="红" aria-label="红" aria-checked="false"></button>
+              </div>
+              <p class="hint">强调色会同时换成对应的深/浅两套值，按钮上的字始终看得清。</p>
+            </div>
+
+            <div class="field">
+              <span class="field-label">字号</span>
+              <div class="seg" id="setting-font-size" role="radiogroup" aria-label="字号">
+                <button class="seg-btn" type="button" data-font-choice="sm" role="radio" aria-checked="false">小</button>
+                <button class="seg-btn is-active" type="button" data-font-choice="md" role="radio" aria-checked="true">中</button>
+                <button class="seg-btn" type="button" data-font-choice="lg" role="radio" aria-checked="false">大</button>
+              </div>
+            </div>
+
+            <div class="appearance-toggles">
+              <label class="switch-row" for="setting-follow-system">
+                <input type="checkbox" class="switch" id="setting-follow-system">
+                <span class="switch-text">跟随系统</span>
+                <span class="hint">系统用浅色就用浅色，切深浅色时自动跟</span>
+              </label>
+
+              <label class="switch-row" for="setting-compact">
+                <input type="checkbox" class="switch" id="setting-compact">
+                <span class="switch-text">紧凑模式</span>
+                <span class="hint">缩小卡片间距与圆角，一屏放下更多</span>
+              </label>
+
+              <label class="switch-row" for="setting-motion">
+                <input type="checkbox" class="switch" id="setting-motion" checked>
+                <span class="switch-text">动效</span>
+                <span class="hint">关掉后所有过渡与动画立即消失</span>
+              </label>
+            </div>
+
+            <div class="row">
+              <button class="btn btn-ghost btn-sm" id="setting-appearance-reset" type="button">恢复默认外观</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- 数据目录 -->
+        <section class="panel panel-main panel-sub">
+          <div class="panel-head">
+            <h2>数据目录</h2>
+            <div class="filters">
+              <span class="muted" id="setting-data-root-current">当前：读取中…</span>
+            </div>
+          </div>
+          <div class="panel-body">
+            <div class="field">
+              <span class="field-label">游戏文件、版本、Java 都放这里</span>
+              <div class="row">
+                <input class="input input-full" id="setting-data-root" type="text" autocomplete="off"
+                       placeholder="例如 D:\PCL3">
+                <button class="btn btn-ghost btn-sm" id="setting-validate-dir" type="button">先校验</button>
+              </div>
+              <p class="hint" id="setting-data-root-check" hidden></p>
+              <p class="hint hint-warn" id="setting-data-root-notice" hidden></p>
+              <p class="hint">改目录<b>不会自动搬数据</b>。保存后新目录立即生效，旧目录里的
+                versions / libraries / assets 仍在原地，需要你手动剪切过去。</p>
+            </div>
+
+            <div class="row">
+              <button class="btn btn-primary" id="setting-save" type="button">保存目录</button>
+              <button class="btn btn-ghost" id="setting-open-config" type="button">打开完整设置弹窗</button>
+            </div>
+            <p class="modal-error error-text" id="setting-error" hidden></p>
+            <p class="hint" id="setting-path-line">配置文件：读取中…</p>
+          </div>
+        </section>
+
+        <!-- 下载源 -->
+        <section class="panel panel-main panel-sub">
+          <div class="panel-head">
+            <h2>下载源</h2>
+            <div class="filters">
+              <span class="muted" id="mirror-hint">—</span>
+            </div>
+          </div>
+          <div class="panel-body">
+            <div class="field">
+              <span class="field-label">选择策略</span>
+              <div class="row">
+                <select class="input select" id="setting-mirror-mode">
+                  <option value="auto">自动测速（推荐：按实测延迟选最快的源）</option>
+                  <option value="fixed">固定使用某个源（不测速）</option>
+                </select>
+                <select class="input select" id="setting-mirror-id" disabled>
+                  <option value="">—</option>
+                </select>
+              </div>
+              <p class="hint" id="setting-mirror-note">
+                自动测速会在启动时和安装前测一次延迟，连续失败会自动换源。
+              </p>
+            </div>
+
+            <!-- 测速结果列表：id 仍是 #mirror-list / #mirror-empty，infra.js 照旧写入 -->
+            <ul class="mirror-list" id="mirror-list">
+              <li class="muted" id="mirror-empty">正在读取测速结果…</li>
+            </ul>
+            <div class="row mirror-actions">
+              <button class="btn btn-ghost btn-sm" id="btn-mirror-probe" type="button">重新测速</button>
+              <button class="btn btn-primary btn-sm" id="setting-save-mirror" type="button">保存下载源</button>
+            </div>
+            <p class="modal-error error-text" id="setting-mirror-error" hidden></p>
+          </div>
+        </section>
+
+        <!--
+          网络代理。
+          为什么需要：部分网络下 cdn.modrinth.com（Fastly）连不上，mod 能搜到却下载失败。
+          这里让用户把代理填进来，之后所有下载（库 / 资源 / mod / 版本元数据）都走它。
+        -->
+        <section class="panel panel-main panel-sub" id="setting-proxy">
+          <div class="panel-head">
+            <h2>网络代理</h2>
+            <div class="filters">
+              <span class="muted" id="proxy-status">—</span>
+            </div>
+          </div>
+          <div class="panel-body">
+            <div class="field">
+              <span class="field-label">代理模式</span>
+              <div class="seg" id="proxy-mode" role="radiogroup" aria-label="代理模式">
+                <button class="seg-btn" type="button" data-proxy-mode="off">不使用</button>
+                <button class="seg-btn is-active" type="button" data-proxy-mode="system">跟随系统</button>
+                <button class="seg-btn" type="button" data-proxy-mode="manual">手动填写</button>
+              </div>
+              <p class="hint" id="proxy-mode-note">
+                「跟随系统」会读取 Windows 系统代理设置；没配系统代理就等于不使用。
+              </p>
+            </div>
+
+            <div class="field" id="proxy-manual-field" hidden>
+              <span class="field-label">代理地址</span>
+              <div class="row">
+                <input class="input input-full" id="proxy-url" type="text" autocomplete="off"
+                  placeholder="http://127.0.0.1:7897 或 socks5://127.0.0.1:1080">
+                <button class="btn btn-ghost btn-sm" id="btn-proxy-detect" type="button">自动探测</button>
+              </div>
+              <p class="hint" id="proxy-detect-hint">
+                不知道自己代理端口的话点「自动探测」，会扫一遍 Clash / v2rayN 等常见端口。
+              </p>
+            </div>
+
+            <div class="field">
+              <span class="field-label">不走代理的主机</span>
+              <input class="input input-full" id="proxy-bypass" type="text" autocomplete="off"
+                placeholder="127.0.0.1,localhost">
+            </div>
+
+            <div class="row mirror-actions">
+              <button class="btn btn-ghost btn-sm" id="btn-proxy-test" type="button">测试连接</button>
+              <button class="btn btn-primary btn-sm" id="btn-proxy-save" type="button">保存代理</button>
+            </div>
+            <p class="hint" id="proxy-test-result" hidden></p>
+            <p class="modal-error error-text" id="proxy-error" hidden></p>
+          </div>
+        </section>
+
+        <!-- 默认内存：说明入口与位置，实际值按版本在卡片齿轮里改 -->
+        <section class="panel panel-main panel-sub">
+          <div class="panel-head">
+            <h2>内存默认值</h2>
+          </div>
+          <div class="panel-body">
+            <p class="hint">
+              默认最大内存 <strong class="mono" id="setting-memory-default">2048</strong> MB（约 2 GB），新版本都按它开局。
+              每个版本可以单独调：到「主页」点当前版本卡片上的 ⚙「设置」，或在「版本」页点某个版本的 ⚙，
+              那里有滑块、最小内存、JVM 参数与 Java 路径。
+            </p>
+            <div class="row">
+              <button class="btn btn-ghost btn-sm" type="button" data-goto="home">去主页看看当前版本</button>
+              <button class="btn btn-ghost btn-sm" type="button" data-goto="versions">去版本页</button>
+            </div>
+          </div>
+        </section>
+      </div>
+    </section>
+
+  </div>
+
+  <!--
+    右侧固定栏：离线账户 / 任务 / 日志。
+    （下载源已移进「设置」页，这里不再重复；它需要常驻的部分只有任务与日志。）
+
+    曾经这里的 <aside> 开始标签在并行开发时被覆盖丢失，导致账户面板掉进主区、
+    整页变成错乱的多列。不要往它里面加新面板。
+  -->
+  <aside class="panel panel-side">
+
+    <div class="panel-head">
+      <h2>离线账户</h2>
+    </div>
+    <div class="panel-body">
+      <form class="row" id="offline-form">
+        <input class="input" id="offline-name" placeholder="玩家名（1~16 字符）" maxlength="16" autocomplete="off">
+        <button class="btn btn-primary" type="submit">保存</button>
+      </form>
+      <p class="hint" id="offline-hint">离线账户只在本机生效，能进离线服务器，不能进正版服务器。</p>
+      <ul class="account-list" id="account-list"></ul>
+    </div>
+
+    <div class="panel-head panel-head-split">
+      <h2>任务</h2>
+      <span class="muted" id="job-hint">—</span>
+    </div>
+    <div class="panel-body">
+      <div class="job" id="job-card" hidden>
+        <div class="job-top">
+          <span class="job-title" id="job-title">—</span>
+          <span class="badge" id="job-status">—</span>
+        </div>
+        <div class="progress"><div class="progress-fill" id="job-bar"></div></div>
+        <div class="job-meta">
+          <span id="job-phase">—</span>
+          <span id="job-count"></span>
+        </div>
+      </div>
+      <p class="empty" id="job-empty">还没有任务。在「下载」页装一个版本，或直接点主页的「启动」。</p>
+    </div>
+
+    <div class="panel-head">
+      <h2>日志</h2>
+      <button class="btn btn-ghost btn-sm" id="btn-clear-log" type="button">清空</button>
+    </div>
+    <div class="panel-body">
+      <pre class="log" id="log">等待输出…</pre>
+    </div>
+
+    <!--
+      基础设施（infra）：下载源测速结果的「入口」。
+      列表与测速按钮已经搬进「设置」页（那里空间大，能列清楚每个源的延迟），
+      这里只留一行状态与跳转，保证任务/日志仍然常驻可见、又不占右栏高度。
+      #btn-open-config 原样保留：infra.js 按 id 绑它，点了照旧弹出 #config-modal。
+    -->
+    <div class="panel-head panel-head-split">
+      <h2>下载源</h2>
+      <span class="muted" id="mirror-hint">—</span>
+    </div>
+    <div class="panel-body">
+      <div class="row mirror-actions">
+        <button class="btn btn-ghost btn-sm" type="button" data-goto="settings">设置 / 测速</button>
+        <button class="btn btn-ghost btn-sm" id="btn-open-config" type="button">全局设置</button>
+      </div>
+    </div>
+
+  </aside>
+</main>
+
+<footer class="footer">
+  <span id="footer-note">PCL3 · 仅监听 127.0.0.1 · 数据不出本机</span>
+  <span id="footer-error" class="error-text" hidden></span>
+</footer>
+
+<!-- 装模组加载器：Fabric / Quilt。纯 DOM，无框架 -->
+<div class="modal-backdrop" id="loader-modal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="loader-title">
+    <div class="modal-head">
+      <h3 id="loader-title">装模组加载器</h3>
+      <button class="btn btn-ghost btn-sm" id="loader-close" type="button" aria-label="关闭">✕</button>
+    </div>
+
+    <div class="modal-body">
+      <p class="modal-sub" id="loader-sub">选择加载器后拉取可用版本。</p>
+
+      <div class="field">
+        <span class="field-label">加载器</span>
+        <div class="seg" id="loader-kind">
+          <button class="seg-btn is-active" type="button" data-kind="fabric">Fabric</button>
+          <button class="seg-btn" type="button" data-kind="quilt">Quilt</button>
+        </div>
+      </div>
+
+      <div class="field">
+        <span class="field-label">加载器版本</span>
+        <div class="row">
+          <select class="input select" id="loader-version" disabled>
+            <option value="">— 正在读取版本列表… —</option>
+          </select>
+          <button class="btn btn-ghost btn-sm" id="loader-reload" type="button" title="重新拉取版本列表">刷新</button>
+        </div>
+        <p class="hint" id="loader-version-hint"></p>
+      </div>
+
+      <p class="modal-error error-text" id="loader-error" hidden></p>
+    </div>
+
+    <div class="modal-foot">
+      <button class="btn btn-ghost" id="loader-cancel" type="button">取消</button>
+      <button class="btn btn-primary" id="loader-confirm" type="button" disabled>开始安装</button>
+    </div>
+  </div>
+</div>
+
+<!-- 版本设置：内存 / JVM 参数。纯 DOM，无框架 -->
+<div class="modal-backdrop" id="settings-modal" hidden>
+  <div class="modal modal-wide" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <div class="modal-head">
+      <h3 id="settings-title">版本设置</h3>
+      <button class="btn btn-ghost btn-sm" id="settings-close" type="button" aria-label="关闭">✕</button>
+    </div>
+
+    <div class="modal-body">
+      <p class="modal-sub" id="settings-sub">调整这个版本独占的内存与 Java 参数。</p>
+
+      <div class="field">
+        <span class="field-label">最大内存</span>
+        <div class="row memory-row">
+          <input type="range" class="range" id="settings-memory-range" min="512" max="16384" step="512" value="2048">
+          <input type="number" class="input input-num" id="settings-memory" min="512" max="65536" step="512" value="2048"
+                 inputmode="numeric" aria-label="最大内存 MB">
+          <span class="unit">MB</span>
+        </div>
+        <p class="hint" id="settings-memory-label">当前 2048 MB（约 2 GB）</p>
+        <p class="hint" id="settings-memory-advice"></p>
+      </div>
+
+      <div class="field">
+        <span class="field-label">最小内存（-Xmn，可选）</span>
+        <div class="row">
+          <input type="number" class="input input-num" id="settings-min-memory" min="512" max="65536" step="512"
+                 placeholder="留空 = 自动（最大内存的 1/4）" inputmode="numeric">
+          <span class="unit">MB</span>
+        </div>
+      </div>
+
+      <div class="field">
+        <span class="field-label">附加 JVM 参数（每行一条）</span>
+        <textarea class="input textarea" id="settings-jvm-args" rows="3"
+                  placeholder="-XX:+UseG1GC&#10;-Dfile.encoding=UTF-8"></textarea>
+        <p class="hint">示例：-XX:+UseG1GC、-Dfml.readTimeout=180。一条一行，不能含换行或空字节。</p>
+      </div>
+
+      <div class="field">
+        <span class="field-label">附加游戏参数（每行一条）</span>
+        <textarea class="input textarea" id="settings-game-args" rows="2"
+                  placeholder="--fullscreen&#10;--width 1280"></textarea>
+      </div>
+
+      <div class="field">
+        <span class="field-label">Java 路径（可选，留空 = 自动查找 / 下载）</span>
+        <input class="input input-full" id="settings-java-path" type="text" autocomplete="off"
+               placeholder="例如 C:\Program Files\Java\jdk-21\bin\javaw.exe">
+      </div>
+
+      <p class="modal-error error-text" id="settings-error" hidden></p>
+    </div>
+
+    <div class="modal-foot">
+      <button class="btn btn-ghost" id="settings-reset" type="button">恢复默认</button>
+      <span class="foot-spacer"></span>
+      <button class="btn btn-ghost" id="settings-cancel" type="button">取消</button>
+      <button class="btn btn-primary" id="settings-save" type="button">保存</button>
+    </div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+
+<!-- 基础设施（infra）：全局设置（数据目录 / 下载源）与崩溃分析。只追加，不改上方任何弹窗 -->
+<div class="modal-backdrop" id="config-modal" hidden>
+  <div class="modal modal-wide" role="dialog" aria-modal="true" aria-labelledby="config-title">
+    <div class="modal-head">
+      <h3 id="config-title">全局设置</h3>
+      <button class="btn btn-ghost btn-sm" id="config-close" type="button" aria-label="关闭">✕</button>
+    </div>
+
+    <div class="modal-body">
+      <p class="modal-sub" id="config-sub">这些设置对整个启动器生效，不是某个版本的设置。</p>
+
+      <div class="field">
+        <span class="field-label">数据目录（游戏文件、版本、Java 都放这里）</span>
+        <div class="row">
+          <input class="input input-full" id="config-data-root" type="text" autocomplete="off"
+                 placeholder="例如 D:\PCL3">
+          <button class="btn btn-ghost btn-sm" id="config-validate-dir" type="button">先校验</button>
+        </div>
+        <p class="hint" id="config-data-root-current">当前：读取中…</p>
+        <p class="hint" id="config-data-root-check"></p>
+        <p class="hint hint-warn" id="config-data-root-notice" hidden></p>
+        <p class="hint">改目录<b>不会自动搬数据</b>。保存后新目录立即生效，旧目录里的
+          versions / libraries / assets 仍在原地，需要你手动剪切过去。</p>
+      </div>
+
+      <div class="field">
+        <span class="field-label">下载源</span>
+        <div class="row">
+          <select class="input select" id="config-mirror-mode">
+            <option value="auto">自动测速（推荐：按实测延迟选最快的源）</option>
+            <option value="fixed">固定使用某个源（不测速）</option>
+          </select>
+          <select class="input select" id="config-mirror-id" disabled>
+            <option value="">—</option>
+          </select>
+        </div>
+        <p class="hint" id="config-mirror-hint">自动测速会在启动时和安装前测一次延迟，连续失败会自动换源。</p>
+      </div>
+
+      <p class="hint" id="config-path-line">配置文件：读取中…</p>
+      <p class="modal-error error-text" id="config-error" hidden></p>
+    </div>
+
+    <div class="modal-foot">
+      <button class="btn btn-ghost" id="config-cancel" type="button">取消</button>
+      <button class="btn btn-primary" id="config-save" type="button">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 崩溃分析结果：启动失败或点「崩溃分析」时弹出，替代直白的原始堆栈 -->
+<div class="modal-backdrop" id="crash-modal" hidden>
+  <div class="modal modal-wide" role="dialog" aria-modal="true" aria-labelledby="crash-title">
+    <div class="modal-head">
+      <h3 id="crash-title">崩溃分析</h3>
+      <button class="btn btn-ghost btn-sm" id="crash-close" type="button" aria-label="关闭">✕</button>
+    </div>
+    <div class="modal-body">
+      <p class="modal-sub" id="crash-sub">正在读取最近的崩溃报告…</p>
+      <ul class="crash-list" id="crash-list"></ul>
+      <p class="hint" id="crash-report-path"></p>
+      <p class="modal-error error-text" id="crash-error" hidden></p>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" id="crash-copy" type="button">复制结论</button>
+      <button class="btn btn-primary" id="crash-ok" type="button">知道了</button>
+    </div>
+  </div>
+</div>
+
+<script src="/infra.js"></script>
+
+<!-- 导入整合包：选文件 → 上传 → 解析 → 预览（纯 DOM，零框架） -->
+<input type="file" id="modpack-file" accept=".mrpack,application/zip,application/x-zip-compressed" hidden>
+
+<script src="/modpack.js"></script>
+
+<!-- 内容：资源包 / 数据包 / 光影包（只新增 DOM 与事件，不改 app.js 的既有结构） -->
+<!-- 导入资源包 / 数据包 / 光影：与整合包用同一个文件选择器的思路，但独立 id，互不干扰 -->
+<input type="file" id="packs-file" accept=".zip,application/zip,application/x-zip-compressed" hidden>
+
+<script src="/packs.js"></script>
+
+<!-- 内容源：Modrinth 搜索 / 安装 / 已装模组（新文件，只追加 DOM 与事件） -->
+<!--
+  模组详情弹窗。
+  正文只放纯文本（后端/前端都会做 Markdown 降级），不塞 innerHTML ——
+  那是第三方内容，直接插进 DOM 等于打开 XSS 面。
+  底部链接按钮由 mods.js 的 renderDetailLinks 动态生成：缺哪个链接就不渲染那个按钮。
+-->
+<div class="modal-backdrop" id="mod-detail" hidden>
+  <div class="modal modal-wide" role="dialog" aria-modal="true" aria-labelledby="mod-detail-title">
+    <div class="modal-head">
+      <h3 id="mod-detail-title">—</h3>
+      <button class="btn btn-ghost btn-sm" id="mod-detail-close" type="button" aria-label="关闭">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="mod-detail-head">
+        <div class="result-icon" id="mod-detail-icon"></div>
+        <div class="mod-detail-headtext">
+          <p class="modal-sub" id="mod-detail-desc">—</p>
+          <p class="muted mod-detail-meta" id="mod-detail-meta"></p>
+        </div>
+      </div>
+      <pre class="mod-detail-body" id="mod-detail-body"></pre>
+      <!-- 前置模组清单：由 mods.js 在打开详情时查询并渲染，每项带「装上前置」按钮 -->
+      <div class="mod-deps" id="mod-detail-deps" hidden></div>
+    </div>
+    <div class="modal-foot mod-detail-links" id="mod-detail-links"></div>
+  </div>
+</div>
+
+<script src="/mods.js"></script>
+
+<!-- 基础便利功能：打开文件夹 / 复制路径 / 复制启动参数 / 磁盘占用（ux 追加，独立文件，不改既有逻辑） -->
+<!-- 「打开文件夹」下拉菜单：由 [data-folder-entry] 的按钮触发，点击别处或 Esc 关闭 -->
+<div class="folder-menu" id="folder-menu" role="menu" aria-label="打开文件夹" hidden></div>
+
+<script src="/folders.js"></script>
+
+<!--
+  重命名版本 / 切换版本 / 重命名弹窗（versions.js）。
+  「实例」概念已取消：原来的「新建实例」弹窗整块删掉，换成下面这个重命名弹窗。
+  重命名只改**显示名**（settings.json 的 displayName），目录名一个字都不动。
+-->
+<div class="modal-backdrop" id="rename-modal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="rename-modal-title">
+    <div class="modal-head">
+      <h3 id="rename-modal-title">重命名版本</h3>
+      <button class="btn btn-ghost btn-sm" id="rename-close" type="button" aria-label="关闭">✕</button>
+    </div>
+
+    <div class="modal-body">
+      <p class="modal-sub" id="rename-sub">
+        只改显示名，目录名（<code id="rename-dir">—</code>）不会变 —— 改了会破坏存档与 mod 的引用。
+      </p>
+
+      <div class="field">
+        <span class="field-label">显示名</span>
+        <input class="input input-full" id="rename-input" type="text" maxlength="48" autocomplete="off"
+               placeholder="例如 26.3 生存服">
+        <p class="hint" id="rename-hint">留空 = 恢复用版本号显示。</p>
+      </div>
+
+      <p class="modal-error error-text" id="rename-error" hidden></p>
+    </div>
+
+    <div class="modal-foot">
+      <button class="btn btn-ghost" id="rename-cancel" type="button">取消</button>
+      <button class="btn btn-primary" id="rename-save" type="button">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 版本选择下拉（「切换版本 ▾」共用一份）：versions.js 按需展开/收起 -->
+<div class="version-picker" id="version-picker" role="listbox" aria-label="选择版本" hidden>
+  <div class="version-picker-head">
+    <input type="search" class="input" id="version-picker-search" placeholder="搜索版本…" autocomplete="off">
+  </div>
+  <ul class="version-picker-list" id="version-picker-list"></ul>
+  <p class="version-picker-empty" id="version-picker-empty" hidden>没有已安装的版本。</p>
+  <div class="version-picker-foot">
+    <button class="btn btn-ghost btn-sm" type="button" data-goto="download">去下载新版本</button>
+  </div>
+</div>
+
+<script src="/versions.js"></script>
+
+<!--
+  启动前体检（preflight）：点「启动」先 POST /api/preflight，有阻断项就列出来并给一键修复按钮。
+  纯 DOM，无框架。只做追加，不动上面任何既有弹窗。
+-->
+<div class="modal-backdrop" id="preflight-modal" hidden>
+  <div class="modal modal-wide" role="dialog" aria-modal="true" aria-labelledby="preflight-title">
+    <div class="modal-head">
+      <h3 id="preflight-title">启动前体检</h3>
+      <button class="btn btn-ghost btn-sm" id="preflight-close" type="button" aria-label="关闭">✕</button>
+    </div>
+
+    <div class="modal-body">
+      <p class="modal-sub" id="preflight-sub">正在检查这个版本能不能启动…</p>
+
+      <div class="preflight-summary" id="preflight-summary" hidden>
+        <span class="pf-pill pf-blocking" id="preflight-count-blocking">0 个阻断</span>
+        <span class="pf-pill pf-warning" id="preflight-count-warning">0 个警告</span>
+        <span class="pf-elapsed" id="preflight-elapsed"></span>
+      </div>
+
+      <ul class="preflight-list" id="preflight-list"></ul>
+      <p class="empty" id="preflight-empty" hidden>体检通过，没有发现问题。</p>
+
+      <p class="modal-error error-text" id="preflight-error" hidden></p>
+    </div>
+
+    <div class="modal-foot">
+      <button class="btn btn-ghost" id="preflight-cancel" type="button">先不启动</button>
+      <button class="btn btn-primary" id="preflight-launch" type="button" hidden>仍然启动</button>
+    </div>
+  </div>
+</div>
+
+<!-- 启动前体检脚本（preflight 追加）：必须在 app.js 之后加载（它复用 app.js 挂在 window 上的工具） -->
+<script src="/preflight.js"></script>
+
+<!--
+  左侧导航（nav.js）：data-page / data-tab 显隐切换 + `#page=…&tab=…` 同步。
+  故意放在**最后**加载 —— 它要在 app.js / packs.js / mods.js 都绑完自己的事件之后，
+  才能「替用户点一下」它们早就绑好的标签按钮（业务脚本一行都不用改）。
+  普通 script 按出现顺序执行，所以这里的顺序就是真顺序。
+-->
+<script src="/nav.js"></script>
+
+<!--
+  主题与外观（theme.js）：主题 / 强调色 / 字号 / 紧凑 / 动效。
+  放在最后：它要 `#btn-theme-toggle` 与设置页的控件都已经在 DOM 里。
+  head 里那段内联脚本已经在首屏把 data-theme 挂好了，这里只接管交互与持久化。
+-->
+<script src="/theme.js"></script>
+<script src="/proxy.js"></script>
+</body>
+</html>

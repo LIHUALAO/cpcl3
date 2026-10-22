@@ -70,19 +70,31 @@ src/
 ```sh
 pnpm install
 pnpm typecheck                      # tsc --noEmit，必须零错误
-pnpm test                           # 147 个测试
+pnpm test                           # 756 个测试
 pnpm check:encoding                 # UTF-8 无 BOM / LF 校验
-pnpm verify                         # 上面三个一起跑
+pnpm check:hygiene                  # 仓库卫生（调试残留 / 临时目录）
+pnpm verify                         # 上面全部一起跑
 pnpm build                          # 产出 dist/
+
+pnpm test:real                      # 含真实下载的完整验证（慢，默认关）
+pnpm clean:tmp                      # 清理 %TEMP% 里的测试残留
 ```
 
 测试直接跑 `.ts` 源码（经 `test/ts-resolve.mjs` 解析钩子），不需要先构建。
 
+**接手维护？** 先读 [docs/MAINTAINER-GUIDE.md](docs/MAINTAINER-GUIDE.md) ——
+里面有架构决策的理由、踩过的坑、和修改后的验证清单。
+
 ## 文档
 
+- [**维护手册（写给 AI 的）**](docs/MAINTAINER-GUIDE.md) —— 架构决策、已知的坑、修改后的验证清单
 - [架构与接口契约](docs/ARCHITECTURE.md)
 - [数据中心目录布局](docs/DATA-LAYOUT.md)
 - [编码规约](docs/ENCODING.md)（Windows 上踩过坑，必读）
+- [对标 PCL2 的差距清单](docs/PCL2-GAP-ANALYSIS.md)
+- [AI 助手设计](docs/AI-ASSISTANT.md)（未实现）
+- [需要真人验证的清单](docs/NEED-MANUAL-TEST.md)
+- [一些想说的话](docs/LETTER.md) —— 不属于技术文档
 - [贡献指南](CONTRIBUTING.md)
 
 ## 合规

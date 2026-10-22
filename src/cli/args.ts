@@ -37,6 +37,13 @@ export interface ParsedArgs {
   values: Record<string, string | number>;
   /** 布尔选项 */
   booleans: Record<string, boolean>;
+  /**
+   * 原始 argv。
+   *
+   * `values` 里同名选项只留最后一次（`--memory 1 --memory 2` → 2），
+   * 但 `--jvm-arg A --jvm-arg B` 这类可重复选项必须看到每一份，所以把原始参数一并带出。
+   */
+  raw: string[];
 }
 
 export class UsageError extends Error {
@@ -186,7 +193,7 @@ export function parseArgs(
     positional.push(token);
   }
 
-  return { command, positional, values, booleans };
+  return { command, positional, values, booleans, raw: [...argv] };
 }
 
 function coerce(raw: string, type: 'number' | 'string', name: string, usage?: string): string | number {

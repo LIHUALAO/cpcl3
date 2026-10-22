@@ -15,7 +15,33 @@ import type { ClientRequest, IncomingMessage } from 'node:http';
 import type { Hash } from 'node:crypto';
 import { URL } from 'node:url';
 
+import { type ProxyEndpoint, proxyCreateConnection, shouldBypass } from './proxy.js';
+
 export type { WriteStream };
+
+// ───────────────────────────── 进程级代理 ─────────────────────────────
+
+/**
+ * 当前生效的代理。设为 undefined 表示直连。
+ *
+ * 为什么用模块级变量而不是一路透传参数：
+ * 下载链路上有 `fetchOne` → `transferOnce` → `openRequest` 好几层，
+ * 每层都加一个 proxy 参数会污染所有签名，而代理是**进程级配置**
+ * （一个启动器只有一个代理），用模块级变量最贴合语义。
+ *
+ * 由 config 模块在配置变更时调用 {@link setActiveProxy} 写入。
+ */
+let currentProxy: ProxyEndpoint | undefined;
+
+/** 设置当前代理。传 undefined / null 即关闭代理。 */
+export function setActiveProxy(proxy: ProxyEndpoint | null | undefined): void {
+  currentProxy = proxy ?? undefined;
+}
+
+/** 读取当前代理（供测试与诊断） */
+export function activeProxy(): ProxyEndpoint | undefined {
+  return currentProxy;
+}
 
 /** 默认最多跟随几跳重定向。5 跳足够覆盖 BMCLAPI 这类「一跳就到位」的轮换节点。 */
 export const DEFAULT_MAX_REDIRECTS = 5;
@@ -34,6 +60,11 @@ export interface TransportOptions {
    * 让上层明确知道「这个源只会把我甩到别处」，而不是拿到一个没法用的 302 响应。
    */
   maxRedirects?: number;
+  /**
+   * 不走代理的主机列表（逗号分隔）。默认 `127.0.0.1,localhost`。
+   * 只在启用代理时生效；`shouldBypass` 里还硬编码了本机地址直连。
+   */
+  proxyBypass?: string;
 }
 
 export const DEFAULT_TRANSPORT: Required<TransportOptions> = {
@@ -41,6 +72,7 @@ export const DEFAULT_TRANSPORT: Required<TransportOptions> = {
   idleTimeoutMs: 30_000,
   userAgent: 'PCL3/0.1 (+https://github.com/pcl3)',
   maxRedirects: DEFAULT_MAX_REDIRECTS,
+  proxyBypass: '127.0.0.1,localhost',
 };
 
 /** 响应 + 已被消费的 body 流。调用方负责 consume 或 destroy。 */
@@ -162,7 +194,6 @@ export function openRequest(
         return;
       }
 
-      const mod = isHttps ? https : http;
       const headers: Record<string, string> = {
         'User-Agent': cfg.userAgent,
         'Accept': '*/*',
@@ -173,7 +204,23 @@ export function openRequest(
         ...extraHeaders,
       };
 
-      const req: ClientRequest = mod.request(parsed, { method: 'GET', headers }, (res) => {
+      // ── 代理 ──────────────────────────────────────────────────────
+      // HTTPS 目标：CONNECT 隧道，TLS 由我们自己在隧道上做（servername 必须是目标域名）。
+      // HTTP  目标：连代理，用绝对 URL 作为请求路径（RFC 7230 §5.3.2）。
+      //
+      // 是否走代理**只**由 bypass 列表决定（默认 `127.0.0.1,localhost`），
+      // 不在代码里额外硬编码「本机直连」—— 那样用户想代理本机服务时反而没法用。
+      const proxy = activeProxy();
+      const useProxy =
+        proxy !== undefined && !shouldBypass(parsed.hostname, cfg.proxyBypass);
+
+      let req!: ClientRequest;
+
+      /**
+       * 响应回调。抽成具名函数是为了让三条分支（直连 / CONNECT 隧道 / http 绝对 URL）
+       * 共用同一套重定向与错误处理逻辑，内部通过闭包引用 `req`。
+       */
+      const onResponse = (res: IncomingMessage): void => {
         clearTimeout(connectTimerAsAny);
 
         const status = res.statusCode ?? 0;
@@ -233,7 +280,54 @@ export function openRequest(
             redirects: maxRedirects - redirectsLeft,
           }),
         );
-      });
+      };
+
+      // ── 真正发请求 ────────────────────────────────────────────────
+      if (useProxy && proxy !== undefined && isHttps) {
+        // HTTPS 目标走 CONNECT 隧道：socket 里已经完成 TLS，https.request 不能再做一次
+        req = https.request(
+          parsed,
+          {
+            method: 'GET',
+            headers,
+            agent: false,
+            createConnection: proxyCreateConnection(
+              proxy,
+              {
+                host: parsed.hostname,
+                port: parsed.port !== '' ? Number(parsed.port) : 443,
+                isHttps: true,
+              },
+              cfg.connectTimeoutMs,
+            ),
+          } as never,
+          onResponse,
+        );
+      } else if (useProxy && proxy !== undefined) {
+        // HTTP 目标：请求行使用绝对 URL（RFC 7230 §5.3.2）
+        headers['Host'] = parsed.host;
+        if (proxy.username !== undefined) {
+          headers['Proxy-Authorization'] = `Basic ${Buffer.from(
+            `${proxy.username}:${proxy.password ?? ''}`,
+          ).toString('base64')}`;
+        }
+        req = http.request(
+          {
+            host: proxy.host,
+            port: proxy.port,
+            method: 'GET',
+            path: parsed.toString(),
+            headers,
+          },
+          onResponse,
+        );
+      } else {
+        req = (isHttps ? https : http).request(
+          parsed,
+          { method: 'GET', headers },
+          onResponse,
+        );
+      }
 
       active = req;
 

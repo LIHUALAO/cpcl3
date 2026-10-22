@@ -12,12 +12,15 @@
 
 import type { ConditionalArg, Library, VersionJson } from '../types.js';
 
-/** Maven 同名判定 key：`group:artifact` */
+/** Maven 同名判定 key：`group:artifact[:classifier]` */
 export function libraryKey(name: string): string {
   const raw = name.trim();
   const withoutExt = raw.includes('@') ? raw.slice(0, raw.lastIndexOf('@')) : raw;
   const parts = withoutExt.split(':');
-  if (parts.length >= 2) return `${parts[0]}:${parts[1]}`;
+  if (parts.length >= 2) {
+    const classifier = parts.length >= 4 ? (parts[3] ?? '') : '';
+    return classifier === '' ? `${parts[0]}:${parts[1]}` : `${parts[0]}:${parts[1]}:${classifier}`;
+  }
   return withoutExt;
 }
 

@@ -39,14 +39,17 @@ import {
   buildPlaceholders,
   evaluateArguments,
   hasClasspathPlaceholder,
+  hasSystemProperty,
   joinClasspath,
   nativeClassifier,
   planLibraries,
   splitLegacyArguments,
   substitute,
+  withDefaultLocale,
 } from './command.js';
 import type { PlaceholderMap } from './command.js';
 import { collectNativeJobs, extractNatives } from './natives.js';
+import { DEFAULT_LANG, ensureChineseOptions } from './options-txt.js';
 import { detectPlatform, libraryAllowed, DEFAULT_FEATURES, type Platform } from './rules.js';
 import {
   findJavaInDataRoot,
@@ -55,6 +58,7 @@ import {
   noJavaMessage,
   type JavaRequirement,
 } from './java.js';
+import { JavaAutoProvisioner } from './java-provision.js';
 import { readLauncherMeta } from './meta.js';
 import { resolveDataRoot } from './data-root.js';
 import { mergeVersionJson } from './version-merge.js';
@@ -88,6 +92,20 @@ export interface GameLauncherDeps {
   features?: Readonly<Record<string, boolean>>;
   /** 覆盖 launcher 名称/版本（默认读根 package.json） */
   launcherMeta?: { name: string; version: string };
+  /**
+   * Java 自动下载器（可选）。缺省时用默认实现（内置 JavaRuntimeInstaller）；
+   * 注入一个「永远没装也没法下」的实例即可在测试里关掉自动下载。
+   */
+  javaProvisioner?: JavaProvisionerLike | null;
+}
+
+/** java-provision.ts 里 `JavaAutoProvisioner.ensureJava` 的结构约束 */
+export interface JavaProvisionerLike {
+  ensureJava(
+    requirement: JavaRequirement,
+    dataRoot: string,
+    explicitPath?: string | null,
+  ): Promise<string>;
 }
 
 export interface LaunchContext {
@@ -103,6 +121,24 @@ export interface LaunchContext {
   nativesRoot: string;
   assetsRoot: string;
   realVersionId: string;
+  /**
+   * 用于定位**游戏本体 jar** 的版本 id。
+   *
+   * 与 `realVersionId` 不同的原因：加载器版本（Fabric / Quilt / Forge …）是纯元数据，
+   * 目录里**只有 json 没有 jar**，真正的 client jar 属于它 `inheritsFrom` 的原版。
+   * 老代码用 `realVersionId` 拼 jar 路径 → classpath 指向不存在的文件 →
+   * Fabric 报 `couldn't locate the game` 直接崩（P0）。
+   *
+   * 解析顺序见 {@link GameLauncher.resolveClientJarVersion}：
+   *   自身目录有 jar → 自身；否则沿 inheritsFrom 链向上找第一个真有 jar 的祖先。
+   * 链上都没 jar 时**退回自身**（保持旧行为），由下游给出可读的错误。
+   */
+  clientJarVersion: string;
+  /**
+   * 资产索引兜底用的版本 id（加载器的 assets 必须跟随原版）。
+   * 正常情况下 `version.assetIndex` / `version.assets` 已由继承链合并带下来，
+   * 这个值只在两者都缺失时兜底。
+   */
   gameVersion: string;
 }
 
@@ -126,12 +162,22 @@ export class GameLauncher {
     const ctx = await this.resolveContext(opts);
     const { version, platform, features } = ctx;
 
+    // 0) 首次启动默认中文：确保 options.txt 存在且含 lang:
+    //    只补缺失，用户改过的语言一个字都不动（见 options-txt.ts）
+    await this.ensureOptionsTxt(ctx);
+
     // 1) natives：解压到实例目录下的隔离子目录，保证 -Djava.library.path 指向真实存在的目录
     const nativesDir = await this.prepareNatives(ctx);
 
     // 2) classpath：按 rules 过滤 → 游戏本体 jar 永远最后
+    //    ⚠ 这里必须用 clientJarVersion 而不是 realVersionId：
+    //    加载器版本没有自己的 jar，jar 属于它 inheritsFrom 的原版。
     const plan = planLibraries(version.libraries ?? [], platform, features);
-    const versionJar = path.join(ctx.versionsRoot, ctx.gameVersion, `${ctx.gameVersion}.jar`);
+    const versionJar = path.join(
+      ctx.versionsRoot,
+      ctx.clientJarVersion,
+      `${ctx.clientJarVersion}.jar`,
+    );
     const classpathEntries = buildClasspath({
       entries: plan.entries,
       librariesRoot: ctx.librariesRoot,
@@ -179,11 +225,16 @@ export class GameLauncher {
       jvmFinal = await this.rewriteToArgfile(ctx, jvmFinal, classpathEntries, platform.classpathSeparator);
     }
 
-    // 8) mainClass 必须在 jvm 参数之后、game 参数之前
-    const mainClass = mainClassOf(version);
-    const args = [...jvmFinal, mainClass, ...gameArgs];
+    // 8) locale 双保险：补 -Duser.language=zh / -Duser.country=CN（与 options.txt 的 lang 配合）。
+    //    必须插在 -cp 之前 —— JVM 一旦读到 -cp 就认为 JVM 参数结束，后面的 -D 会被当成类名。
+    //    用户自己传过任何一个键就不重复添加（见 withDefaultLocale 的逐键判断）。
+    const jvmWithLocale = insertLocaleBeforeClasspath(jvmFinal);
 
-    const java = this.pickJava(opts, version, ctx, nativesDir);
+    // 9) mainClass 必须在 jvm 参数之后、game 参数之前
+    const mainClass = mainClassOf(version);
+    const args = [...jvmWithLocale, mainClass, ...gameArgs];
+
+    const java = await this.pickJava(opts, version, ctx, nativesDir);
     return { java, args, cwd: ctx.gameDir };
   }
 
@@ -228,7 +279,16 @@ export class GameLauncher {
     //   否则取数据目录 <dataRoot>/versions/<id>/<id>.jar
     const isolated = isFile(path.join(instanceDir, 'versions', realVersionId, `${realVersionId}.json`));
     const versionsRoot = isolated ? path.join(instanceDir, 'versions') : path.join(dataRoot, 'versions');
-    const gameVersion = realVersionId;
+
+    // 游戏本体 jar 的定位（P0 修复）：沿 inheritsFrom 链向下找真正带 jar 的版本
+    const clientJarVersion = await this.resolveClientJarVersion(
+      opts.versionId,
+      realVersionId,
+      versionsRoot,
+    );
+
+    // 资产索引兜底跟随原版（加载器自身不带 assets）
+    const gameVersion = clientJarVersion || realVersionId;
 
     return {
       version,
@@ -242,8 +302,83 @@ export class GameLauncher {
       nativesRoot: path.join(instanceDir, 'natives'),
       assetsRoot: path.join(dataRoot, 'assets'),
       realVersionId,
+      clientJarVersion,
       gameVersion,
     };
+  }
+
+  /**
+   * 找到真正持有 client jar 的版本 id。
+   *
+   * 背景：Fabric / Quilt / Forge 这类加载器版本的目录里只有 json，jar 属于原版。
+   * 老代码直接把 `<realVersionId>.jar` 塞进 classpath，于是 Fabric 的 Knot 报
+   * `Class path entries reference missing files` + `couldn't locate the game`。
+   *
+   * 解析顺序：
+   *   1. `<versionsRoot>/<realVersionId>/<realVersionId>.jar` 存在 → 用它（原版）
+   *   2. 否则从**未合并**的原始 JSON 读 `inheritsFrom`，沿链向上逐级找第一个有 jar 的版本
+   *   3. 整条链都没 jar → 退回 realVersionId（保持旧行为，让缺文件错误落在它身上）
+   *
+   * 注意：合并后的 `version` 已经没有 `inheritsFrom`（resolveInherited 会清掉），
+   * 所以这里必须重新读原始 JSON，不能依赖 ctx.version。
+   */
+  private async resolveClientJarVersion(
+    requestedId: string,
+    realVersionId: string,
+    versionsRoot: string,
+  ): Promise<string> {
+    const jarOf = (id: string): string => path.join(versionsRoot, id, `${id}.jar`);
+
+    if (isFile(jarOf(realVersionId))) return realVersionId;
+
+    // 沿 inheritsFrom 链向上找（最多 16 层，防环）
+    const seen = new Set<string>([realVersionId]);
+    let currentId = await this.inheritsFromOf(requestedId);
+    let depth = 0;
+
+    while (currentId.length > 0 && depth < 16) {
+      if (seen.has(currentId)) break;
+      seen.add(currentId);
+      if (isFile(jarOf(currentId))) return currentId;
+      currentId = await this.inheritsFromOf(currentId);
+      depth += 1;
+    }
+
+    // 链上没有任何 jar：退回自身，让下游明确报告缺文件
+    return realVersionId;
+  }
+
+  /** 读未合并 JSON 的 inheritsFrom；读不到返回空串 */
+  private async inheritsFromOf(id: string): Promise<string> {
+    try {
+      const raw = await this.fetchRawVersion(id);
+      return typeof raw.inheritsFrom === 'string' ? raw.inheritsFrom : '';
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * 读**未合并**的版本 JSON（保留 inheritsFrom）。
+   *
+   * 不用 `loadVersion`：它返回 resolveInherited 处理过的合并结果，
+   * `inheritsFrom` 已被清成 undefined，拿不到链接信息。
+   *
+   * 优先用仓库的 `fetchVersion`（version 模块已改为「本地 versions/<id>/<id>.json 优先」），
+   * 仓库不可用时直接读磁盘。
+   */
+  private async fetchRawVersion(id: string): Promise<VersionJson> {
+    const repo = this.deps.versionRepo as VersionRepositoryLike;
+    if (typeof repo.fetchVersion === 'function') {
+      try {
+        return await repo.fetchVersion(id);
+      } catch {
+        /* 落到本地磁盘读取 */
+      }
+    }
+    const file = path.join(this.dataRoot(), 'versions', id, `${id}.json`);
+    const text = await fsp.readFile(file, 'utf8');
+    return JSON.parse(text) as VersionJson;
   }
 
   private async loadVersion(id: string): Promise<VersionJson> {
@@ -304,6 +439,41 @@ export class GameLauncher {
     }
     merged.inheritsFrom = undefined;
     return merged;
+  }
+
+  // ── 内部：options.txt（首次启动默认中文） ──────────────────
+
+  /**
+   * 确保实例目录下有 `options.txt` 且包含 `lang:`。
+   *
+   * 为什么在启动前做：Minecraft 的界面语言**只认 options.txt 的 lang: 行**，
+   * assets 里本来就带全部语言文件。首次启动没有该文件时，游戏按 JVM locale 猜，
+   * 经常猜错落回 en_us（用户实测到的「英文界面」）。
+   *
+   * 安全边界（这个文件是用户资产，写坏 = 画质/键位/音量全丢）：
+   *   - 「只补不改」：已有 lang: 就一个字都不写，也不留备份
+   *   - 真要写之前先备份，备份失败则放弃写入（action = 'skipped-backup-failed'）
+   *   - 实例隔离：路径只由 ctx.instanceDir 决定，绝不跨实例
+   * 无论如何都不影响启动（配置问题不该阻止玩游戏），只打日志。
+   */
+  private async ensureOptionsTxt(ctx: LaunchContext): Promise<void> {
+    try {
+      const result = await ensureChineseOptions(ctx.instanceDir);
+      if (result.action === 'created') {
+        console.info(`[launch] 已生成默认 options.txt（lang:${DEFAULT_LANG}）：${result.file}`);
+      } else if (result.action === 'appended-lang') {
+        console.info(
+          `[launch] 已为现有 options.txt 追加 lang:${DEFAULT_LANG}：${result.file}` +
+            (result.backup ? `（原文件已备份到 ${path.basename(result.backup)}）` : ''),
+        );
+      } else if (result.action === 'skipped-backup-failed') {
+        // 备份失败 → 明确告知用户「我们没敢动你的配置」，而不是静默
+        console.warn(`[launch] ${result.skippedReason ?? '备份失败，已跳过修改 options.txt'}`);
+      }
+      // action === 'unchanged' 静默（用户已有语言设置，尊重之）
+    } catch (err) {
+      console.warn(`[launch] 生成 options.txt 失败（不影响启动）：${(err as Error).message}`);
+    }
   }
 
   // ── 内部：natives ───────────────────────────────────────────
@@ -473,7 +643,12 @@ export class GameLauncher {
 
   // ── 内部：java ─────────────────────────────────────────────
 
-  private pickJava(opts: LaunchOptions, version: VersionJson, ctx: LaunchContext, _nativesDir: string): string {
+  private async pickJava(
+    opts: LaunchOptions,
+    version: VersionJson,
+    ctx: LaunchContext,
+    _nativesDir: string,
+  ): Promise<string> {
     // 1) 显式指定
     const raw = opts.javaPath?.trim();
     if (raw && raw.length > 0) {
@@ -485,13 +660,24 @@ export class GameLauncher {
       );
     }
 
-    // 2) 数据目录下自动下载的 JRE（按 javaVersion.majorVersion 匹配）
     const requirement = javaRequirement(version);
-    const found = findJavaInDataRoot(ctx.dataRoot, requirement);
-    const first = found[0];
+
+    // 2) 数据目录下已有的 JRE（按 javaVersion.majorVersion 匹配）—— 命中则零网络
+    const first = findJavaInDataRoot(ctx.dataRoot, requirement)[0];
     if (first) return javaExecutable(first.javaHome);
 
-    // 3) 找不到 → 明确报错，绝不拿一个错误版本的 java 去启动
+    // 3) 本地没有 → 自动下载（Java 21 等）。下载失败会抛出人话错误，不静默用错版本。
+    //    provisioner 缺省为 null 时退回原来的「明确报错」行为。
+    const provisioner = this.deps.javaProvisioner === undefined
+      ? new JavaAutoProvisioner({ dataRoot: ctx.dataRoot })
+      : this.deps.javaProvisioner;
+    if (provisioner === null || provisioner === undefined) {
+      throw new Error(noJavaMessage(requirement, ctx.dataRoot, []));
+    }
+    const downloaded = await provisioner.ensureJava(requirement, ctx.dataRoot, null);
+    if (downloaded) return downloaded;
+
+    // 4) 兜底：绝不用一个错误版本的 java 去启动
     throw new Error(noJavaMessage(requirement, ctx.dataRoot, []));
   }
 }
@@ -504,6 +690,31 @@ function isFile(p: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * 把默认 locale 参数插到 `-cp` **之前**。
+ *
+ * 为什么不能简单 append：JVM 读到 `-cp <value>` 就认为选项区结束，
+ * 之后再出现的 `-Dxxx` 会被当成主类名 → `Could not find or load main class -Duser.language=zh`。
+ *
+ * 找不到 `-cp` / `-classpath` 时（理论上不会发生，jvmArgumentTemplates 保证有）
+ * 就追加到末尾。
+ */
+function insertLocaleBeforeClasspath(args: readonly string[]): string[] {
+  const withLocale = withDefaultLocale(args);
+  // withDefaultLocale 只会在尾部 append，这里把新加的项挪到 -cp 前面
+  const added = withLocale.length - args.length;
+  if (added <= 0) return withLocale;
+
+  const localeArgs = withLocale.slice(withLocale.length - added);
+  const base = withLocale.slice(0, withLocale.length - added);
+
+  const cpAt = base.findIndex(
+    (a) => a === '-cp' || a === '-classpath' || a.startsWith('-cp=') || a.startsWith('-classpath='),
+  );
+  if (cpAt < 0) return [...base, ...localeArgs];
+  return [...base.slice(0, cpAt), ...localeArgs, ...base.slice(cpAt)];
 }
 
 /**

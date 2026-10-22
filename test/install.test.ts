@@ -63,6 +63,67 @@ class FakeDownloader {
   }
 }
 
+/**
+ * 真写盘版 fake：会真的往 dest 写文件，这样 install() 的磁盘复核才有意义。
+ *
+ * - `failOn` 决定哪些任务「报告失败且不写盘」
+ * - `dropSilently` 模拟 P0 bug 的形态：downloader **谎报成功**（不写盘也不进 failed），
+ *   历史 bug 里 worker 抛异常正是这个效果
+ * - `preexisting` 里的 dest 视为已存在（用于测「重跑只补缺失」）
+ */
+class WritingFakeDownloader {
+  readonly calls: DownloadTask[][] = [];
+  private readonly failOn: (task: DownloadTask) => boolean;
+  private readonly dropSilently: (task: DownloadTask) => boolean;
+  private readonly preexisting: Set<string>;
+
+  constructor(opts: {
+    failOn?: (task: DownloadTask) => boolean;
+    dropSilently?: (task: DownloadTask) => boolean;
+    preexisting?: Set<string>;
+  } = {}) {
+    this.failOn = opts.failOn ?? (() => false);
+    this.dropSilently = opts.dropSilently ?? (() => false);
+    this.preexisting = opts.preexisting ?? new Set();
+  }
+
+  /** 本次真正尝试（且非 preexisting）的任务 */
+  get attempted(): DownloadTask[] {
+    return this.calls.flat().filter((t) => !this.preexisting.has(t.dest));
+  }
+
+  async downloadAll(
+    tasks: DownloadTask[],
+    onProgress?: (p: { done: number; total: number; current: string }) => void,
+  ): Promise<DownloadResult> {
+    this.calls.push(tasks);
+    const result: DownloadResult = { ok: true, skipped: 0, downloaded: 0, failed: [] };
+    let done = 0;
+    for (const task of tasks) {
+      onProgress?.({ done, total: tasks.length, current: task.dest });
+      if (this.preexisting.has(task.dest)) {
+        result.skipped += 1;
+        done += 1;
+        continue;
+      }
+      if (this.failOn(task)) {
+        result.failed.push(task);
+      } else if (this.dropSilently(task)) {
+        // 谎报成功：既不写盘，也不进 failed —— 这就是 P0 bug 的形态
+        result.downloaded += 1;
+      } else {
+        fs.mkdirSync(path.dirname(task.dest), { recursive: true });
+        fs.writeFileSync(task.dest, `content:${path.basename(task.dest)}`, 'utf8');
+        result.downloaded += 1;
+      }
+      done += 1;
+    }
+    onProgress?.({ done, total: tasks.length, current: '' });
+    result.ok = result.failed.length === 0;
+    return result;
+  }
+}
+
 class FakeVersionRepository {
   private readonly versions: Record<string, VersionJson>;
 
@@ -443,7 +504,9 @@ describe('VanillaInstaller.install', () => {
     fs.mkdirSync(path.join(tmpRoot, 'assets', 'indexes'), { recursive: true });
     fs.writeFileSync(path.join(tmpRoot, 'assets', 'indexes', '17.json'), JSON.stringify(assetIndex), 'utf8');
 
-    const downloader = new FakeDownloader();
+    // 必须用会真写盘的 fake：install() 现在做磁盘复核，
+    // 只「记账不写盘」的 fake 会被正确判定为 downloader 谎报（这正是 P0  defenses 生效的证明）
+    const downloader = new WritingFakeDownloader();
     const installer = new VanillaInstaller(
       {
         versionRepo: new FakeVersionRepository({ '1.21': makeVersion121(assetIndex) }) as never,
@@ -490,7 +553,188 @@ describe('VanillaInstaller.install', () => {
       { dataRoot: tmpRoot, os: WINDOWS },
     );
 
-    await assert.rejects(() => installer.install('1.21'), /下载失败/);
+    await assert.rejects(() => installer.install('1.21'), /未落地|下载失败/);
+  });
+});
+
+// ─────────────────── P0：安装失败绝不能被判成成功 ───────────────────
+
+describe('install 失败传播与磁盘复核（P0 回归）', () => {
+  let root: string;
+
+  before(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'pcl3-p0-'));
+  });
+  after(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  /** 每个用例独立数据根，避免相互污染 */
+  function freshRoot(label: string): string {
+    const dir = path.join(root, label);
+    fs.mkdirSync(path.join(dir, 'assets', 'indexes'), { recursive: true });
+    return dir;
+  }
+
+  function makeInstaller(dir: string, downloader: unknown, assetIndex: AssetIndex) {
+    fs.writeFileSync(path.join(dir, 'assets', 'indexes', '17.json'), JSON.stringify(assetIndex), 'utf8');
+    return new VanillaInstaller(
+      {
+        versionRepo: new FakeVersionRepository({ '1.21': makeVersion121(assetIndex) }) as never,
+        downloader: downloader as never,
+      },
+      { dataRoot: dir, os: WINDOWS },
+    );
+  }
+
+  it('downloader 返回 ok:false 且 failed 非空 → install 必须抛错', async () => {
+    const dir = freshRoot('fail-loud');
+    const assetIndex = makeAssetIndex(3);
+    const dl = new WritingFakeDownloader({ failOn: (t) => t.dest.includes('assets') });
+    const installer = makeInstaller(dir, dl, assetIndex);
+
+    await assert.rejects(
+      () => installer.install('1.21'),
+      (err: Error) => {
+        assert.match(err.message, /下载失败/, '错误信息必须点明「下载失败」');
+        assert.match(err.message, /assets/, '错误信息应指明阶段');
+        return true;
+      },
+    );
+  });
+
+  it('downloader 谎报成功（不写盘也不进 failed）→ 磁盘复核必须抛错', async () => {
+    const dir = freshRoot('lie');
+    const assetIndex = makeAssetIndex(4);
+    // 只静默丢弃 1 个 asset 任务（其余正常写盘）：整盘只剩这一个缺失，
+    // 正是旧 bug 中「个别 worker 抛异常、任务凭空蒸发」的真实形态
+    let dropped = false;
+    const dl = new WritingFakeDownloader({
+      dropSilently: (t) => {
+        if (dropped) return false;
+        if (!t.dest.includes(`${path.sep}assets${path.sep}objects${path.sep}`)) return false;
+        dropped = true;
+        return true;
+      },
+    });
+    const installer = makeInstaller(dir, dl, assetIndex);
+
+    await assert.rejects(
+      () => installer.install('1.21'),
+      (err: Error) => {
+        assert.match(err.message, /下载失败/);
+        assert.match(err.message, /复核/, '应由收尾磁盘复核发现');
+        return true;
+      },
+    );
+    assert.equal(dropped, true, '必须真的触发过静默丢弃');
+  });
+
+  it('失败时不得上报 done 事件', async () => {
+    const dir = freshRoot('no-done');
+    const assetIndex = makeAssetIndex(3);
+    const phases: string[] = [];
+    const dl = new WritingFakeDownloader({ failOn: (t) => t.dest.includes('assets') });
+    const installer = makeInstaller(dir, dl, assetIndex);
+    await assert.rejects(() =>
+      installer.install('1.21', (p) => {
+        phases.push(p.phase);
+      }),
+    );
+    assert.ok(!phases.includes('done'), `失败时不得上报 done，实际：${phases.join(' → ')}`);
+  });
+
+  it('ok:false 但 failed 为空（downloader 自相矛盾）→ 也必须抛错', async () => {
+    const dir = freshRoot('inconsistent');
+    const assetIndex = makeAssetIndex(1);
+    const lying = {
+      async downloadAll(tasks: DownloadTask[]): Promise<DownloadResult> {
+        // 写盘成功，却报告 ok:false
+        for (const t of tasks) {
+          fs.mkdirSync(path.dirname(t.dest), { recursive: true });
+          fs.writeFileSync(t.dest, 'x', 'utf8');
+        }
+        return { ok: false, skipped: 0, downloaded: tasks.length, failed: [] };
+      },
+    };
+    const installer = makeInstaller(dir, lying, assetIndex);
+    await assert.rejects(() => installer.install('1.21'), /ok=false/);
+  });
+
+  it('部分已存在 + 部分缺失 → 重跑只补缺失的，已存在的计入 skipped', async () => {
+    const dir = freshRoot('resume');
+    const assetIndex = makeAssetIndex(6);
+
+    // 第一遍：全量装成功
+    const first = new WritingFakeDownloader();
+    await makeInstaller(dir, first, assetIndex).install('1.21');
+    const firstAttempted = first.attempted.length;
+    assert.ok(firstAttempted > 0, '第一遍应当有任务被下载');
+
+    // 删掉 2 个 asset 文件，模拟上次中断/漏下
+    const objectDirs = fs.readdirSync(path.join(dir, 'assets', 'objects'));
+    const removed: string[] = [];
+    for (const sub of objectDirs) {
+      for (const f of fs.readdirSync(path.join(dir, 'assets', 'objects', sub))) {
+        if (removed.length < 2) {
+          const full = path.join(dir, 'assets', 'objects', sub, f);
+          fs.rmSync(full);
+          removed.push(full);
+        }
+      }
+    }
+    assert.equal(removed.length, 2, '应成功删掉 2 个文件');
+
+    // 第二遍：所有已存在的 dest 视为 preexisting（模拟 downloader 的跳过逻辑）
+    const existing = new Set<string>();
+    const walk = (d: string): void => {
+      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+        const p = path.join(d, e.name);
+        if (e.isDirectory()) walk(p);
+        else existing.add(p);
+      }
+    };
+    walk(path.join(dir, 'assets', 'objects'));
+    walk(path.join(dir, 'libraries'));
+    walk(path.join(dir, 'versions'));
+
+    const second = new WritingFakeDownloader({ preexisting: existing });
+    await makeInstaller(dir, second, assetIndex).install('1.21');
+
+    // 第二遍真正尝试下载的，应当只有被删的那 2 个 asset。
+    // 排除两个「天然会重试」的项：
+    //   - 版本 JSON 本体（install() 末尾总会重写合并后的 <id>.json）
+    //   - asset index 文件（install 阶段会重新拉一次索引，确保与远端一致）
+    const alwaysRetried = new Set(['1.21.json', '17.json']);
+    const attemptedExceptJson = second.attempted.filter(
+      (t) => !alwaysRetried.has(path.basename(t.dest)),
+    );
+    assert.equal(
+      attemptedExceptJson.length,
+      2,
+      `重跑应只补 2 个缺失 asset，实际尝试 ${String(attemptedExceptJson.length)} 个：` +
+        attemptedExceptJson.map((t) => path.basename(t.dest)).join(', '),
+    );
+    for (const p of removed) {
+      assert.ok(fs.existsSync(p), `缺失文件应被补回：${p}`);
+    }
+
+    // 全量复核：所有任务目标都在
+    const plan = await makeInstaller(dir, new WritingFakeDownloader(), assetIndex).plan('1.21');
+    for (const t of plan.tasks) {
+      assert.ok(fs.existsSync(t.dest), `重跑后仍缺失：${t.dest}`);
+    }
+  });
+
+  it('全部成功时，done 事件才发一次', async () => {
+    const dir = freshRoot('success');
+    const assetIndex = makeAssetIndex(2);
+    const phases: string[] = [];
+    const installer = makeInstaller(dir, new WritingFakeDownloader(), assetIndex);
+    await installer.install('1.21', (p) => {
+      if (phases.at(-1) !== p.phase) phases.push(p.phase);
+    });
+    assert.deepEqual(phases, ['meta', 'libraries', 'natives', 'assets', 'done']);
   });
 });
 

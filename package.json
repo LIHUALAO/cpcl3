@@ -10,12 +10,16 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && node scripts/copy-web-assets.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --import ./test/ts-resolve.mjs --test \"test/**/*.test.ts\"",
     "test:watch": "node --import ./test/ts-resolve.mjs --test --watch \"test/**/*.test.ts\"",
+    "test:real": "node scripts/run-real-test.mjs",
     "check:encoding": "node scripts/check-encoding.mjs",
-    "verify": "npm run typecheck && npm run check:encoding && npm test"
+    "check:hygiene": "node scripts/check-hygiene.mjs",
+    "check:hygiene:full": "node scripts/check-hygiene.mjs --tmp",
+    "clean:tmp": "node scripts/check-hygiene.mjs --clean",
+    "verify": "npm run typecheck && npm run check:encoding && npm run check:hygiene && npm test"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

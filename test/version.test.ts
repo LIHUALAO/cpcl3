@@ -10,7 +10,7 @@
  *   6. getDataRoot —— 环境变量优先。
  */
 
-import { test } from 'node:test';
+import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as http from 'node:http';
@@ -35,9 +35,29 @@ import type { Logger, VersionJson, VersionManifest } from '../src/core/version/i
 
 // ───────────────────────────── 工具 ─────────────────────────────
 
+/**
+ * 本文件创建过的临时数据根，进程退出前统一删除。
+ *
+ * 为什么需要：60+ 个用例各自建目录，绝大多数不手工清理，
+ * 每跑一次全量就会在 %TEMP% 留下上百个 `pcl3-version-*`（实测累积 152 个）。
+ * `after()` 在断言失败时也会执行，比逐个用例 try/finally 更可靠。
+ */
+const createdDataRoots: string[] = [];
+
+after(() => {
+  for (const dir of createdDataRoots) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      /* 清理失败不影响测试结论 */
+    }
+  }
+});
+
 function tmpDataRoot(tag: string): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), `pcl3-version-${tag}-`));
   fs.mkdirSync(path.join(dir, 'meta'), { recursive: true });
+  createdDataRoots.push(dir);
   return dir;
 }
 
@@ -503,7 +523,118 @@ test('fetchText: 4xx 不重试，直接抛 FetchError', async () => {
   }
 });
 
-// ───────────────────────────── 6. getDataRoot ─────────────────────────────
+// ───────────────────── 7. 本地已安装版本优先（P0：加载器版本不在 manifest 里） ─────────────────────
+
+/** 写一个「已安装版本」：<dataRoot>/versions/<id>/<id>.json */
+function writeInstalledVersion(dataRoot: string, json: VersionJson): void {
+  const dir = path.join(dataRoot, 'versions', json.id);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${json.id}.json`), JSON.stringify(json, null, 2), 'utf8');
+}
+
+const LOADER_JSON: VersionJson = {
+  id: 'fabric-loader-0.19.5-1.21',
+  type: 'release',
+  mainClass: 'net.fabricmc.loader.impl.launch.knot.KnotClient',
+  assets: '',
+  inheritsFrom: '1.21',
+  libraries: [
+    { name: 'net.fabricmc:fabric-loader:0.19.5', url: 'https://maven.fabricmc.net/' },
+    { name: 'org.ow2.asm:asm:9.7.1', url: 'https://maven.fabricmc.net/' },
+  ],
+  arguments: { game: [], jvm: ['-DFabricMcEmu= net.minecraft.client.main.Main '] },
+};
+
+test('fetchVersion: 不在 manifest 里但本地已安装 → 返回本地副本，不抛错', async () => {
+  const dataRoot = tmpDataRoot('installed');
+  fs.writeFileSync(path.join(dataRoot, 'meta', MANIFEST_CACHE_FILE), JSON.stringify(SAMPLE_MANIFEST), 'utf8');
+  writeInstalledVersion(dataRoot, LOADER_JSON);
+
+  const { logger, warnings } = collectLogger();
+  const repo = new VersionRepository({ dataRoot, logger, fetchImpl: explodingFetch });
+
+  const json = await repo.fetchVersion('fabric-loader-0.19.5-1.21');
+  assert.equal(json.id, 'fabric-loader-0.19.5-1.21');
+  assert.equal(json.inheritsFrom, '1.21', '本地副本要原样返回，inheritsFrom 不能被吞掉');
+  assert.equal(json.libraries.length, 2);
+  // 只允许「manifest 拉取失败回退缓存」这一条 warning（TTL 判定所致），
+  // 不允许出现「version fetch failed / falling back to stale」这类版本级错误。
+  assert.ok(
+    !warnings.some((w) => w.includes('version fetch failed')),
+    `不应走错误路径回退，实际：${warnings.join(' | ')}`,
+  );
+
+  // 应回填 meta 缓存，第二次不触网
+  assert.ok(fs.existsSync(path.join(dataRoot, 'meta', 'fabric-loader-0.19.5-1.21.json')), '应回填 meta 缓存');
+  const again = await repo.fetchVersion('fabric-loader-0.19.5-1.21');
+  assert.equal(again.id, 'fabric-loader-0.19.5-1.21');
+});
+
+test('fetchVersion: 不在 manifest 且本地也没有 → 仍然抛 not found', async () => {
+  const dataRoot = tmpDataRoot('notinstalled');
+  fs.writeFileSync(path.join(dataRoot, 'meta', MANIFEST_CACHE_FILE), JSON.stringify(SAMPLE_MANIFEST), 'utf8');
+  const repo = new VersionRepository({ dataRoot, logger: collectLogger().logger, fetchImpl: explodingFetch });
+
+  await assert.rejects(
+    () => repo.fetchVersion('fabric-loader-9.9.9-1.21'),
+    /not found in manifest/,
+  );
+});
+
+test('fetchVersion: 本地副本损坏（非 JSON）→ 不被当成有效版本', async () => {
+  const dataRoot = tmpDataRoot('corrupt');
+  fs.writeFileSync(path.join(dataRoot, 'meta', MANIFEST_CACHE_FILE), JSON.stringify(SAMPLE_MANIFEST), 'utf8');
+  const dir = path.join(dataRoot, 'versions', 'broken-1.0');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'broken-1.0.json'), '{ not valid json', 'utf8');
+
+  const repo = new VersionRepository({ dataRoot, logger: collectLogger().logger, fetchImpl: explodingFetch });
+  await assert.rejects(() => repo.fetchVersion('broken-1.0'), /not found in manifest/);
+});
+
+test('fetchVersion: 本地副本缺 id 字段 → 视为无效，回落到 manifest 分支报错', async () => {
+  const dataRoot = tmpDataRoot('noid');
+  fs.writeFileSync(path.join(dataRoot, 'meta', MANIFEST_CACHE_FILE), JSON.stringify(SAMPLE_MANIFEST), 'utf8');
+  const dir = path.join(dataRoot, 'versions', 'noid-1.0');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'noid-1.0.json'), JSON.stringify({ mainClass: 'X' }), 'utf8');
+
+  const repo = new VersionRepository({ dataRoot, logger: collectLogger().logger, fetchImpl: explodingFetch });
+  await assert.rejects(() => repo.fetchVersion('noid-1.0'), /not found in manifest/);
+});
+
+test('readInstalledVersion: 直接读 <dataRoot>/versions/<id>/<id>.json，不触网', () => {
+  const dataRoot = tmpDataRoot('readinstalled');
+  writeInstalledVersion(dataRoot, LOADER_JSON);
+  const repo = new VersionRepository({ dataRoot, logger: collectLogger().logger, fetchImpl: explodingFetch });
+
+  const json = repo.readInstalledVersion('fabric-loader-0.19.5-1.21');
+  assert.ok(json);
+  assert.equal(json?.mainClass, 'net.fabricmc.loader.impl.launch.knot.KnotClient');
+  assert.equal(repo.readInstalledVersion('nope-1.0'), undefined);
+});
+
+test('fetchVersion: manifest 里有该版本时仍走网络（本地副本不抢优先级）', async () => {
+  const dataRoot = tmpDataRoot('manifestwins');
+  fs.writeFileSync(path.join(dataRoot, 'meta', MANIFEST_CACHE_FILE), JSON.stringify(SAMPLE_MANIFEST), 'utf8');
+  // 本地放一份「假的」1.21，内容与网络版不同
+  writeInstalledVersion(dataRoot, { ...PARENT_JSON, id: '1.21', mainClass: 'local.fake.Main' });
+
+  const seen: string[] = [];
+  const stubFetch: FetchJsonFn = async (url) => {
+    seen.push(url);
+    if (url.includes('version_manifest')) return { data: SAMPLE_MANIFEST, url, statusCode: 200 };
+    return { data: PARENT_JSON, url, statusCode: 200 };
+  };
+  const repo = new VersionRepository({ dataRoot, logger: collectLogger().logger, fetchImpl: stubFetch });
+
+  const json = await repo.fetchVersion('1.21');
+  const versionFetches = seen.filter((u) => !u.includes('version_manifest'));
+  assert.equal(versionFetches.length, 1, 'manifest 有的版本应正常触网拉取版本 JSON');
+  assert.equal(json.mainClass, PARENT_JSON.mainClass, '应使用网络版本而不是本地副本');
+});
+
+// ───────────────────────────── 8. getDataRoot ─────────────────────────────
 
 test('getDataRoot: PCL3_DATA_ROOT 优先', () => {
   const prev = process.env['PCL3_DATA_ROOT'];

@@ -87,6 +87,7 @@ pnpm clean:tmp                      # 清理 %TEMP% 里的测试残留
 
 ## 文档
 
+- [**需求与愿景（唯一真源）**](docs/REQUIREMENTS.md) —— 主人对 PCL3 的全部要求，用 C# 重写前必读
 - [**维护手册（写给 AI 的）**](docs/MAINTAINER-GUIDE.md) —— 架构决策、已知的坑、修改后的验证清单
 - [架构与接口契约](docs/ARCHITECTURE.md)
 - [数据中心目录布局](docs/DATA-LAYOUT.md)
